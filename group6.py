@@ -30,14 +30,14 @@ class Companyn(TradingCompany):
             missing = [trade for trade in trades if trade not in assigned]
             if missing:
                 logger.warning(
-                    "PERSON2: {} of {} awarded trades could not be planned: {}",
+                    "{} of {} awarded trades could not be planned: {}",
                     len(missing), len(trades), missing,
                 )
 
             if result.schedules:
                 rejected = self.apply_schedules(result.schedules)
                 if rejected:
-                    logger.warning("PERSON2: MABLE rejected schedule(s): {}", rejected)
+                    logger.warning("MABLE rejected schedule(s): {}", rejected)
 
     def propose_schedules(self, trades):
         """pre-auction minimum-cost feasible planning"""
