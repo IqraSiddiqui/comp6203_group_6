@@ -18,30 +18,30 @@ class Companyn(TradingCompany):
         return bids
 
     def receive(self, contracts, auction_ledger=None, *args, **kwargs):
+        """schedule actual awarded trades, preserving commitments"""
         trades = [contract.trade for contract in contracts]
-
-        proposal = self.propose_schedules(trades)
-
-        missing = [
-            trade for trade in trades
-            if trade not in proposal.scheduled_trades
-        ]
-
-        rejected = self.apply_schedules(proposal.schedules)
-
-        if missing or rejected:
-            logger.warning(
-                "Scheduling issues: missing={}, rejected={}",
-                len(missing),
-                rejected
+        if trades:
+            payments = {contract.trade: contract.payment for contract in contracts}
+            result = self.make_scheduler(time_budget_s=12.0).plan(
+                trades, payments=payments
             )
 
-    def propose_schedules(self, trades):
-        optimizer = SchedulingOptimizer(
-            cost_function=self.estimate_schedule_cost
-        )
+            assigned = set(result.scheduled_trades)
+            missing = [trade for trade in trades if trade not in assigned]
+            if missing:
+                logger.warning(
+                    "PERSON2: {} of {} awarded trades could not be planned: {}",
+                    len(missing), len(trades), missing,
+                )
 
-        return optimizer.plan_schedules(
-            fleet=self.fleet,
-            trades=trades
+            if result.schedules:
+                rejected = self.apply_schedules(result.schedules)
+                if rejected:
+                    logger.warning("PERSON2: MABLE rejected schedule(s): {}", rejected)
+
+    def propose_schedules(self, trades):
+        """pre-auction minimum-cost feasible planning"""
+        result = self.make_scheduler(time_budget_s=8.0).plan(trades)
+        return ScheduleProposal(
+            result.schedules, result.scheduled_trades, result.costs
         )
