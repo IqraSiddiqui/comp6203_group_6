@@ -1,10 +1,13 @@
+"""MABLE scheduling optimisation. """
 """
-The planner requires a monetary schedule-cost function from Person 1:
-    cost_fn(vessel, schedule) -> float
-
+TO DO:
+The cost_fn is Person 1's interface:
+    cost_fn(vessel, schedule) -> TOTAL monetary cost of that schedule.
+Without it this module is still a *feasibility* scheduler, NOT a cost
+optimiser. Cost values are deliberately omitted in that case.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from random import Random
 from time import monotonic
@@ -12,25 +15,31 @@ from time import monotonic
 
 @dataclass
 class PlanningResult:
-    schedules: dict          # Vessel -> proposed updated Schedule
-    scheduled_trades: list   # Trades successfully inserted
-    costs: dict             # Trade -> incremental cost at time of insertion
+    schedules: dict = field(default_factory=dict)       # vessel -> new Schedule
+    scheduled_trades: list = field(default_factory=list)  # inserted Trade objects
+    costs: dict = field(default_factory=dict)            # trade -> sequential marginal cost
+    total_extra_cost: float = 0.0
 
 
-class SchedulePlanner:
-    """Greedy minimum-cost insertion with optional randomized restarts.
+class SchedulingOptimizer:
+    """Feasible-first, minimum-cost insertion with multi-start search.
 
-    Feasibility is checked by MABLE's Schedule.verify_schedule().
-    Does not alter live vessel schedules; all insertions are on copies.
+    Pre-auction: maximises the number of trades assigned, then minimises
+    the total incremental operating cost.
+    Post-auction: same coverage priority, then maximises total *awarded*
+    payments minus incremental cost (only relevant if some trades cannot
+    be scheduled). Never deliberately drops an awarded contract merely
+    because its marginal cost exceeds its payment.
 
-    Scoring: first maximise number of scheduled trades; then minimise
-    additional total cost relative to starting vessel schedules.
+    This is an AAMAS-inspired heuristic, not an exact implementation of
+    the winning algorithm or proof that all awarded trades are feasible.
     """
 
-    def __init__(self, fleet, cost_fn, restarts=1, time_budget_s=12.0, seed=42):
-        if not callable(cost_fn):
-            raise TypeError("cost_fn must be callable: cost_fn(vessel, schedule)")
+    def __init__(self, fleet, cost_fn=None, restarts=8,
+                 time_budget_s=8.0, seed=42):
         self.fleet = list(fleet)
+        if cost_fn is not None and not callable(cost_fn):
+            raise TypeError("cost_fn must be callable or None")
         self.cost_fn = cost_fn
         self.restarts = max(1, int(restarts))
         self.time_budget_s = max(0.1, float(time_budget_s))
@@ -39,86 +48,42 @@ class SchedulePlanner:
     def _cost(self, vessel, schedule):
         value = float(self.cost_fn(vessel, schedule))
         if not isfinite(value) or value < 0:
-            raise ValueError("cost_fn must return a finite, nonnegative monetary cost")
+            raise ValueError("Schedule cost must be finite and non-negative")
         return value
 
-    def best_insertion(self, trade, schedules, deadline=None):
-        """Return (vessel, candidate_schedule, additional_cost), or None.
+    def _candidates(self, base_schedule, trade, append_only):
+        """Yield independently copied, feasible insertion alternatives.
 
-        `schedules` holds tentative plans built in this run; vessels absent
-        from it still use their existing real `vessel.schedule` (a copy).
+        MABLE's documented locations are indices from the *base* schedule.
+        Its add_transportation() performs the pickup/dropoff offset itself.
         """
-        best = None
-        for vessel in self.fleet:
-            if deadline is not None and monotonic() >= deadline:
-                return best
+        if append_only:
+            trial = base_schedule.copy()
+            trial.add_transportation(trade)
+            if trial.verify_schedule():
+                yield trial
+            return
 
-            base = schedules.get(vessel)
-            if base is None:
-                base = vessel.schedule
-            base_cost = self._cost(vessel, base)
-            positions = list(base.get_insertion_points())
+        points = list(base_schedule.get_insertion_points())
+        for pickup in points:
+            for dropoff in points:
+                if dropoff < pickup:
+                    continue
+                trial = base_schedule.copy()
+                try:
+                    trial.add_transportation(
+                        trade,
+                        location_pick_up=pickup,
+                        location_drop_off=dropoff,
+                    )
+                except (ValueError, IndexError, AssertionError):
+                    # An insertion point pair may not be accepted.
+                    continue
+                if trial.verify_schedule():
+                    yield trial
 
-            for pickup_point in positions:
-                for dropoff_point in positions:
-                    if dropoff_point < pickup_point:
-                        continue  # Pickup must happen before drop-off.
-                    if deadline is not None and monotonic() >= deadline:
-                        return best
+    def best_insertion(self, trade, tentative_schedules, deadline=None,
+                       append_only=False):
+        """Return (vessel, copied_candidate_schedule, marginal_cost), or None.
 
-                    candidate = base.copy()
-                    try:
-                        candidate.add_transportation(
-                            trade,
-                            location_pick_up=pickup_point,
-                            location_drop_off=dropoff_point,
-                        )
-                    except (ValueError, IndexError, AssertionError):
-                        # Some position pairs may be disallowed by MABLE.
-                        continue
-
-                    if not candidate.verify_schedule():
-                        continue
-
-                    extra_cost = self._cost(vessel, candidate) - base_cost
-                    if best is None or extra_cost < best[2]:
-                        best = (vessel, candidate, extra_cost)
-
-        return best
-
-    def _one_run(self, ordered_trades, deadline):
-        schedules = {}
-        assigned = []
-        incremental_costs = {}
-
-        for trade in ordered_trades:
-            if monotonic() >= deadline:
-                break
-            choice = self.best_insertion(trade, schedules, deadline)
-            if choice is None:
-                continue
-            vessel, candidate, additional_cost = choice
-            schedules[vessel] = candidate
-            assigned.append(trade)
-            incremental_costs[trade] = additional_cost
-
-        return PlanningResult(schedules, assigned, incremental_costs)
-
-    @staticmethod
-    def _rank(result):
-        # Rank by coverage first, then the sum of new operating costs.
-        return (-len(result.scheduled_trades), sum(result.costs.values()))
-
-    def plan(self, trades):
-        """Construct a feasible low-cost tentative plan for the given trades.
-
-        `restarts=1` = Lab 2's greedy baseline, but with cost-aware insertion.
-        `restarts>1` = simplified AAMAS multi-start heuristic.
-        """
-        trades = list(trades)
-        if not trades:
-            return PlanningResult({}, [], {})
-
-        rng = Random(self.seed)
-        deadline = monotonic() + self.time_budget_s
-        best = None
+        Never mutates vessel.schedule or any other live MABLE object.
