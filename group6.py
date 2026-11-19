@@ -1,7 +1,7 @@
 from mable.cargo_bidding import TradingCompany
 from mable.transport_operation import ScheduleProposal, Bid
 from loguru import logger
-from scheduler import SchedulingOptimizer
+from source.scheduler import SchedulingOptimizer
 
 class Companyn(TradingCompany):
     def pre_inform(self, trades, time):
