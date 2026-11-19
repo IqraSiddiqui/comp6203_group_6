@@ -1,7 +1,7 @@
 """MABLE scheduling optimisation. """
 """
 TO DO:
-replace dummy cost with cost_fn(vessel, schedule) -> TOTAL monetary cost of that schedule.
+replace dummy cost with cost_fn(vessel, schedule) that gives the TOTAL monetary cost of that schedule 
 """
 
 from dataclasses import dataclass, field
