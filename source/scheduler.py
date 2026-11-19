@@ -1,10 +1,7 @@
 """MABLE scheduling optimisation. """
 """
 TO DO:
-The cost_fn is Person 1's interface:
-    cost_fn(vessel, schedule) -> TOTAL monetary cost of that schedule.
-Without it this module is still a *feasibility* scheduler, NOT a cost
-optimiser. Cost values are deliberately omitted in that case.
+replace dummy cost with cost_fn(vessel, schedule) -> TOTAL monetary cost of that schedule.
 """
 
 from dataclasses import dataclass, field
