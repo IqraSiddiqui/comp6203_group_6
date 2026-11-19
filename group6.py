@@ -38,6 +38,15 @@ class Companyn(TradingCompany):
                 rejected = self.apply_schedules(result.schedules)
                 if rejected:
                     logger.warning("MABLE rejected schedule(s): {}", rejected)
+    def make_scheduler(self, time_budget_s=8.0):
+        cost_fn = getattr(self, "estimate_schedule_cost", None)
+
+        return SchedulingOptimizer(
+            fleet=self.fleet,
+            cost_fn=cost_fn,
+            restarts=8,
+            time_budget_s=time_budget_s,
+        )
 
     def propose_schedules(self, trades):
         """pre-auction minimum-cost feasible planning"""
