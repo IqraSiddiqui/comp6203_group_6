@@ -20,7 +20,7 @@ from time import monotonic
 from loguru import logger
 from mable.transport_operation import Bid
 
-from scheduler import SchedulingOptimizer
+from source.scheduler import SchedulingOptimizer
 
 
 # From Person 3's Phase 2. Smaller search budgets fit MABLE's inform timeout
