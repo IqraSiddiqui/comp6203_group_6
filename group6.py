@@ -1,21 +1,20 @@
 from mable.cargo_bidding import TradingCompany
-from mable.transport_operation import ScheduleProposal, Bid
+from mable.transport_operation import ScheduleProposal
 from loguru import logger
-from source.scheduler import SchedulingOptimizer
+from scheduler import SchedulingOptimizer
+from bidding import BiddingStrategy
 
 class Companyn(TradingCompany):
     def pre_inform(self, trades, time):
         pass
 
     def inform(self, trades, *args, **kwargs):
-        proposed_scheduling = self.propose_schedules(trades)
-        scheduled_trades = proposed_scheduling.scheduled_trades
-        trades_and_costs = [
-            (x, proposed_scheduling.costs[x]) if x in proposed_scheduling.costs
-            else (x, 1000)
-            for x in scheduled_trades]
-        bids = [Bid(amount=cost, trade=one_trade) for one_trade, cost in trades_and_costs]
-        return bids
+        """Person 3's bidding strategy, using Person 2's feasible plans."""
+        try:
+            return BiddingStrategy(self).make_bids(trades)
+        except Exception:
+            logger.exception("Error in Companyn.inform()")
+            return []
 
     def receive(self, contracts, auction_ledger=None, *args, **kwargs):
         """schedule actual awarded trades, preserving commitments"""
@@ -38,6 +37,7 @@ class Companyn(TradingCompany):
                 rejected = self.apply_schedules(result.schedules)
                 if rejected:
                     logger.warning("MABLE rejected schedule(s): {}", rejected)
+
     def make_scheduler(self, time_budget_s=8.0):
         cost_fn = getattr(self, "estimate_schedule_cost", None)
 
