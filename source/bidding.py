@@ -1,4 +1,3 @@
-#person 3 add your code here
 """Person 3: standalone bidding strategy for the MABLE shipping agent.
 
 This is an ADAPTATION of Person 3's Phase 1/2 strategy to Person 2's
@@ -269,6 +268,7 @@ class BiddingStrategy:
                 allocated_sums[trade_id] += plan.allocation[trade_id]
                 vessel_votes[trade_id][vessel] += 1
         bids = []
+        future_discounts = 0
         for trade in trades:
             key = id(trade)
             if not frequencies[key]:
@@ -280,15 +280,44 @@ class BiddingStrategy:
             try:
                 absolute = self._dedicated_cost(vessel, trade)
                 marginal = allocated_sums[key] / frequencies[key]
-                amount = max(MIN_BID, 0.5 * (absolute + marginal))
-                if not math.isfinite(amount):
+                # Person 3's base valuation, prior to future-opportunity adjustment.
+                base_cost = max(MIN_BID, 0.5 * (absolute + marginal))
+                if not math.isfinite(base_cost):
                     raise ValueError("Non-finite bid")
             except Exception:
                 logger.exception("Bidding: could not price trade {}; skipping", trade)
                 continue
+
+            # Person 4: discounted estimated future repositioning opportunity.
+            # This can be switched off for an A/B comparison by setting
+            # `company.enable_future_bid_bonus = False`.
+            amount = base_cost
+            if getattr(self.company, "enable_future_bid_bonus", True):
+                bonus_fn = getattr(self.company, "future_trade_bonus", None)
+                if callable(bonus_fn):
+                    try:
+                        bonus = float(bonus_fn(vessel, trade, cost=base_cost))
+                        if not math.isfinite(bonus) or bonus < 0:
+                            raise ValueError("Invalid future-trade bonus")
+                        amount = max(MIN_BID, base_cost - bonus)
+                        if amount < base_cost:
+                            future_discounts += 1
+                    except Exception:
+                        logger.exception("Bidding: P4 bonus failed for {}; using base bid", trade)
+                        amount = base_cost
+
+            # Person 4: remember our own cost estimate and bid for ledger analysis.
+            record_fn = getattr(self.company, "record_our_bid", None)
+            if callable(record_fn):
+                try:
+                    record_fn(trade, base_cost, amount)
+                except Exception:
+                    logger.exception("Bidding: could not record bid for {}", trade)
             bids.append(Bid(amount=amount, trade=trade))
         logger.info(
             "Bidding: {} bids for {} trades, based on {} distinct plans (p_select={:.2f})",
             len(bids), len(trades), len(plans), self.p_select,
         )
+        if hasattr(self.company, "future_trade_bonus"):
+            logger.info("P4: future bonus adjusted {} of {} bids", future_discounts, len(bids))
         return bids
