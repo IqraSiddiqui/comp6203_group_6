@@ -3,7 +3,7 @@ Run: python -m unittest -v test_person2_complete.py
 """
 import unittest
 from dataclasses import dataclass
-from scheduler import SchedulingOptimizer
+from source.scheduler import SchedulingOptimizer
 
 
 @dataclass(frozen=True)
