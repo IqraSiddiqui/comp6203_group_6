@@ -806,25 +806,30 @@ class PlanningResult:
 
 
 class SchedulingOptimizer:
-    """Feasible-first, minimum-cost insertion with multi-start search.
+    """Multi-start feasible insertion, scored using estimated *net income*.
 
-    Pre-auction: maximises the number of trades assigned, then minimises
-    the total incremental operating cost.
-    Post-auction: same coverage priority, then maximises total *awarded*
-    payments minus incremental cost (only relevant if some trades cannot
-    be scheduled). Never deliberately drops an awarded contract merely
-    because its marginal cost exceeds its payment.
+    Pre-auction uses coverage then cost.  Post-auction payments are already
+    awarded, so the income comparison between schedules is equivalent to
+    minimising incremental fleet operating cost PLUS estimated penalties for
+    contracts left unfulfilled. If penalty estimates cannot be obtained,
+    revert to fulfilment-first ranking; never manufacture a penalty value.
 
-    This is an AAMAS-inspired heuristic, not an exact implementation of
-    the winning algorithm or proof that all awarded trades are feasible.
+    For post-auction search, the first restart is deterministic greed; later
+    restarts sample from a restricted candidate list (AAMAS-inspired GRASP).
+    Every trial schedule is copied and verified by MABLE.
     """
 
     def __init__(self, fleet, cost_fn=None, restarts=8,
-                 time_budget_s=8.0, seed=42):
+                 time_budget_s=8.0, seed=42, penalty_fn=None,
+                 post_rcl_size=3):
         self.fleet = list(fleet)
         if cost_fn is not None and not callable(cost_fn):
             raise TypeError("cost_fn must be callable or None")
+        if penalty_fn is not None and not callable(penalty_fn):
+            raise TypeError("penalty_fn must be callable or None")
         self.cost_fn = cost_fn
+        self.penalty_fn = penalty_fn
+        self.post_rcl_size = max(1, int(post_rcl_size))
         self.restarts = max(1, int(restarts))
         self.time_budget_s = max(0.1, float(time_budget_s))
         self.seed = seed
@@ -836,14 +841,13 @@ class SchedulingOptimizer:
         return value
 
     def _candidates(self, base_schedule, trade, append_only):
-        """Yield independently copied, feasible insertion alternatives.
-
-        MABLE's documented locations are indices from the *base* schedule.
-        Its add_transportation() performs the pickup/dropoff offset itself.
-        """
+        """Yield copied, feasible insertion alternatives only."""
         if append_only:
             trial = base_schedule.copy()
-            trial.add_transportation(trade)
+            try:
+                trial.add_transportation(trade)
+            except (ValueError, IndexError, AssertionError):
+                return
             if trial.verify_schedule():
                 yield trial
             return
@@ -861,24 +865,18 @@ class SchedulingOptimizer:
                         location_drop_off=dropoff,
                     )
                 except (ValueError, IndexError, AssertionError):
-                    # An insertion point pair may not be accepted.
                     continue
                 if trial.verify_schedule():
                     yield trial
 
     def best_insertion(self, trade, tentative_schedules, deadline=None,
                        append_only=False):
-        """Return (vessel, copied_candidate_schedule, marginal_cost), or None.
-
-        Never mutates vessel.schedule or any other live MABLE object.
-        """
+        """Return (vessel, copied_schedule, marginal_cost), or None."""
         best = None
         for vessel in self.fleet:
             if deadline is not None and monotonic() >= deadline:
                 break
-            base = tentative_schedules.get(vessel)
-            if base is None:
-                base = vessel.schedule
+            base = tentative_schedules.get(vessel, vessel.schedule)
             old_cost = self._cost(vessel, base) if self.cost_fn else 0.0
             for candidate in self._candidates(base, trade, append_only):
                 extra_cost = (
@@ -887,8 +885,6 @@ class SchedulingOptimizer:
                 )
                 if best is None or extra_cost < best[2]:
                     best = (vessel, candidate, extra_cost)
-                # A feasibility-only run needn't explore more alternatives
-                # for this vessel; there is no meaningful cost comparison.
                 if self.cost_fn is None:
                     break
                 if deadline is not None and monotonic() >= deadline:
@@ -918,33 +914,43 @@ class SchedulingOptimizer:
                 self._assign(result, trade, best)
         return result
 
-    def _post_auction_run(self, order, payments, deadline):
-        """Revenue-driven insertion on awarded contracts (AAMAS-inspired).
+    def _post_auction_run(self, order, payments, deadline,
+                          penalties=None, rng=None, rcl_size=1):
+        """Construct a revenue/cost-aware post-award schedule.
 
-        At each step select a feasible trade/vessel/position combination
-        with maximum payment - marginal cost. All feasible awarded trades
-        remain eligible even when this value is negative, because failing
-        to fulfil a won contract may incur a penalty.
+        With penalty estimates, priority is penalty avoided minus insertion
+        cost. This reflects that awarded payments are already fixed across
+        all schedules. Without estimates, use AAMAS payment minus cost.
+
+        Do not drop feasible awards just because they have a negative gain:
+        unfulfilled contracts may carry an additional penalty. RCL
+        randomisation explores alternative insertion orders on restarts.
         """
         result = PlanningResult()
         remaining = list(order)
         while remaining and monotonic() < deadline:
-            best_choice = None
-            best_trade = None
-            best_gain = float("-inf")
+            candidates = []
             for trade in remaining:
                 if monotonic() >= deadline:
                     break
                 choice = self.best_insertion(trade, result.schedules, deadline)
                 if choice is None:
                     continue
-                gain = float(payments.get(trade, 0.0)) - choice[2]
-                if best_choice is None or gain > best_gain:
-                    best_choice, best_trade, best_gain = choice, trade, gain
-            if best_choice is None:
+                priority = (
+                    penalties[trade] - choice[2]
+                    if penalties is not None
+                    else float(payments.get(trade, 0.0)) - choice[2]
+                )
+                # Earlier pickup as a tie-breaker, where available.
+                candidates.append((priority, trade, choice))
+            if not candidates:
                 break
-            self._assign(result, best_trade, best_choice)
-            remaining.remove(best_trade)
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            limit = min(max(1, rcl_size), len(candidates))
+            selected = candidates[0] if limit == 1 else rng.choice(candidates[:limit])
+            _, trade, choice = selected
+            self._assign(result, trade, choice)
+            remaining.remove(trade)
         return result
 
     @staticmethod
@@ -952,58 +958,82 @@ class SchedulingOptimizer:
         value = getattr(trade, "latest_pickup", None)
         return float("inf") if value is None else value
 
-    def _quality(self, result, payments):
-        """Higher is better. All awarded commitments have priority."""
-        revenue = (
-            sum(float(payments.get(t, 0.0)) for t in result.scheduled_trades)
-            if payments is not None else 0.0
-        )
-        return (
-            len(result.scheduled_trades),
-            revenue - result.total_extra_cost,
-        )
+    def _penalty_estimates(self, trades):
+        """Return penalty mapping or None if estimates are unavailable.
+
+        Never use an arbitrary default penalty: an incorrect estimate can
+        make missing an award appear cheaper than delivering it.
+        """
+        if self.penalty_fn is None:
+            return None
+        estimates = {}
+        for trade in trades:
+            try:
+                penalty = float(self.penalty_fn(trade))
+            except Exception:
+                return None
+            if not isfinite(penalty) or penalty < 0:
+                return None
+            estimates[trade] = penalty
+        return estimates
+
+    def _quality(self, result, payments, penalties=None, awarded=None):
+        """Larger is better; use full income when penalties are estimable."""
+        if payments is None:
+            return (len(result.scheduled_trades), -result.total_extra_cost)
+        if penalties is None:
+            # Unknown non-delivery penalty: safeguard fulfilment first.
+            return (len(result.scheduled_trades), -result.total_extra_cost)
+        scheduled = set(result.scheduled_trades)
+        missing = [t for t in awarded if t not in scheduled]
+        gross_revenue = sum(float(payments.get(t, 0.0)) for t in awarded)
+        proxy_income = (gross_revenue - result.total_extra_cost
+                        - sum(penalties[t] for t in missing))
+        return (proxy_income, len(result.scheduled_trades),
+                -result.total_extra_cost)
 
     def plan(self, trades, payments=None):
-        """Construct a good feasible tentative plan.
+        """Return the best verified plan found within the time budget.
 
-        payments: optional mapping of *awarded* Trade -> Contract.payment.
-        Only use this for post-auction planning, not speculative bids.
+        `payments` must contain *awarded* contract payments, not bid guesses.
+        Existing vessel schedule costs are subtracted via marginal costing.
         """
         trades = list(trades)
         if not trades:
             return PlanningResult()
-
         deadline = monotonic() + self.time_budget_s
         rng = Random(self.seed)
+        penalties = self._penalty_estimates(trades) if payments is not None else None
 
-        # A quick append-only baseline is useful as a safe fallback if an
-        # expensive minimum-cost search hits its decision-time budget.
+        # Preserve a quick feasible fallback (no penalty-driven omissions).
         best = self._one_run(trades, deadline, append_only=True)
-
         orders = [trades.copy()]
         if self.restarts >= 2:
             orders.append(sorted(trades, key=self._latest_pickup))
         if self.restarts >= 3 and payments is not None:
             orders.append(sorted(trades,
                                  key=lambda t: -float(payments.get(t, 0.0))))
-
         while len(orders) < self.restarts:
             shuffled = trades.copy()
             rng.shuffle(shuffled)
             orders.append(shuffled)
 
-        for order in orders[:self.restarts]:
+        for run, order in enumerate(orders[:self.restarts]):
             if monotonic() >= deadline:
                 break
             if payments is None:
                 candidate = self._one_run(order, deadline, append_only=False)
             else:
-                candidate = self._post_auction_run(order, payments, deadline)
-            if self._quality(candidate, payments) > self._quality(best, payments):
+                candidate = self._post_auction_run(
+                    order, payments, deadline, penalties=penalties,
+                    rng=rng, rcl_size=(1 if run == 0 else self.post_rcl_size),
+                )
+            if self._quality(candidate, payments, penalties, trades) > \
+                    self._quality(best, payments, penalties, trades):
                 best = candidate
 
-        # Repair: sometimes a second attempt can insert an unscheduled
-        # trade into the best tentative plan without disrupting commitments.
+        # Last chance: insert any unserved awarded trades without disturbing
+        # commitments, and never worsen a feasible full-coverage result.
         assigned = set(best.scheduled_trades)
         for trade in trades:
             if monotonic() >= deadline:
@@ -1013,9 +1043,14 @@ class SchedulingOptimizer:
             choice = self.best_insertion(trade, best.schedules, deadline)
             if choice is None:
                 continue
+            # A positive expected penalty-saving justifies this insertion;
+            # otherwise retain the income-optimal partial plan. Without a
+            # reliable penalty estimate, always fulfil feasible commitments.
+            if (payments is not None and penalties is not None
+                    and choice[2] > penalties[trade]):
+                continue
             self._assign(best, trade, choice)
             assigned.add(trade)
-
         return best
 
 # ================== END scheduler.py ==================
@@ -1669,16 +1704,39 @@ class BiddingStrategy:
                 frequencies[trade_id] += 1
                 allocated_sums[trade_id] += plan.allocation[trade_id]
                 vessel_votes[trade_id][vessel] += 1
+        # Robustness extension of AAMAS pre-scheduling: select a *single*
+        # verified candidate route plan that covers the largest number of
+        # frequency-eligible trades. The submitted set is then a subset of
+        # that plan, rather than a union of potentially incompatible plans.
+        # This does NOT guarantee that MABLE will fulfil every partial win,
+        # but avoids one source of bid-set incompatibility.
+        eligible_ids = {
+            id(trade) for trade in trades
+            if frequencies[id(trade)]
+            and frequencies[id(trade)] / len(plans) >= self.p_select
+        }
+        anchor = max(
+            plans,
+            key=lambda p: (
+                sum(key in p.assignments for key in eligible_ids),
+                p.efficiency,
+            ),
+        )
+        logger.info(
+            "Bidding: {} frequency-eligible trades; {} jointly represented "
+            "by anchor plan",
+            len(eligible_ids),
+            sum(key in anchor.assignments for key in eligible_ids),
+        )
         bids = []
         future_discounts = 0
         for trade in trades:
             key = id(trade)
-            if not frequencies[key]:
+            if key not in eligible_ids or key not in anchor.assignments:
                 continue
-            appearance = frequencies[key] / len(plans)
-            if appearance < self.p_select:
-                continue
-            vessel = vessel_votes[key].most_common(1)[0][0]
+            # Absolute cost must be evaluated on the vessel from the
+            # anchor plan, ensuring consistency with the shared route.
+            vessel = anchor.assignments[key]
             try:
                 absolute = self._dedicated_cost(vessel, trade)
                 marginal = allocated_sums[key] / frequencies[key]
@@ -1774,6 +1832,10 @@ class Company6(FuturePlanningMixin, TradingCompany):
                 )
 
             if result.schedules:
+                logger.info(
+                    "POST_AUCTION: awarded={} scheduled={} estimated_added_fleet_cost={:.2f}",
+                    len(trades), len(result.scheduled_trades), result.total_extra_cost,
+                )
                 rejected = self.apply_schedules(result.schedules)
                 if rejected:
                     logger.warning("MABLE rejected schedule(s): {}", rejected)
@@ -1790,14 +1852,57 @@ class Company6(FuturePlanningMixin, TradingCompany):
             vessel, trade, headquarters=self.headquarters
         )
 
-    def make_scheduler(self, time_budget_s=8.0):
-        cost_fn = getattr(self, "estimate_schedule_cost", None)
+    def estimate_non_delivery_penalty(self, trade):
+        """Conservative proxy for MABLE's non-delivery penalty.
 
+        Based on Person 3's original penalty estimator: dedicated voyage fuel
+        for the largest capable vessel (ballast to origin, laden delivery,
+        loading and unloading). MABLE may compute the real penalty from the
+        vessel's *end-of-simulation* position, which we cannot know here.
+        This is an estimate, not a guaranteed reproduction of MABLE's rule.
+        """
+        candidates = []
+        for vessel in self.fleet:
+            capacity = None
+            for attribute in ("get_max_capacity", "capacity"):
+                method = getattr(vessel, attribute, None)
+                if callable(method):
+                    try:
+                        capacity = float(method(trade.cargo_type))
+                        break
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+            if capacity is not None and math.isfinite(capacity):
+                candidates.append((capacity, vessel))
+        if not candidates:
+            raise CostEstimationError("Could not estimate penalty: vessel capacities unavailable")
+        capacity, vessel = max(candidates, key=lambda item: item[0])
+        # MABLE's penalty estimate is based on the largest vessel, not
+        # necessarily one that would be selected by the route scheduler.
+        end_fn = getattr(self, "_p4_end_location", None)
+        start = end_fn(vessel) if callable(end_fn) else vessel.location
+        origin = trade.origin_port
+        destination = trade.destination_port
+        ballast_dist = _get_distance(start, origin, vessel, self.headquarters)
+        laden_dist = _get_distance(origin, destination, vessel, self.headquarters)
+        loading_time = vessel.get_loading_time(trade.cargo_type, trade.amount)
+        ballast_time = vessel.get_travel_time(ballast_dist)
+        laden_time = vessel.get_travel_time(laden_dist)
+        fuel = (
+            vessel.get_ballast_consumption(ballast_time, vessel.speed)
+            + vessel.get_laden_consumption(laden_time, vessel.speed)
+            + 2.0 * vessel.get_loading_consumption(loading_time)
+        )
+        return _fuel_cost(vessel, fuel)
+
+    def make_scheduler(self, time_budget_s=8.0):
         return SchedulingOptimizer(
             fleet=self.fleet,
-            cost_fn=cost_fn,
+            cost_fn=self.estimate_schedule_cost,
+            penalty_fn=self.estimate_non_delivery_penalty,
             restarts=8,
             time_budget_s=time_budget_s,
+            post_rcl_size=3,
         )
 
     def propose_schedules(self, trades):
