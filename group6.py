@@ -1404,8 +1404,10 @@ import math
 class FuturePlanningMixin:
 
     # ---- tuning knobs (good things to vary in the report's experiments) ----
-    FUTURE_WEIGHT = 0.6         # how much of the estimated saving we trust
-    FUTURE_CAP_FRACTION = 0.30  # bonus never exceeds 30% of the trade's cost
+    # AAMAS-inspired robustness: uncertain future wins should not justify
+    # aggressive underbidding on a contract we can win right now.
+    FUTURE_WEIGHT = 0.55        # discounted value of credible future savings
+    FUTURE_CAP_FRACTION = 0.18  # protect current-contract economics
     FUTURE_TOP_K = 2            # count the best K follow-on trades (decaying)
     FUTURE_DECAY = 0.5          # weight of the 2nd-best, 3rd-best, ... trade
     DEFAULT_MARKET_FACTOR = 1.2 # assumed competitor markup before we have data
@@ -1432,6 +1434,10 @@ class FuturePlanningMixin:
         self._p4_price_predictions = {}  # trade key -> (raw forecast, opponent name)
         self._p4_price_ratios = []        # realised payment / raw forecast
         self._p4_price_ape = []           # absolute percentage error (realised denominator)
+        # Only on OUR wins does the second-price payment correspond to the
+        # cheapest competing bid. Rival-win payments are a *different* bid.
+        self._p4_second_price_ratios = []  # payment / min estimated competitor cost
+        self._p4_future_context = {}       # cached comparison per announced future trade
 
     # ======================================================== pre_inform
     def pre_inform(self, trades, time):
@@ -1439,6 +1445,7 @@ class FuturePlanningMixin:
         self._p4_init()
         self._future_trades = list(trades) if trades else []
         self._future_auction_time = time
+        self._p4_future_context.clear()
 
     # ============================================================ helpers
     @staticmethod
@@ -1533,6 +1540,8 @@ class FuturePlanningMixin:
                 continue
             snap[company.name] = [(v, v.location) for v in company.fleet]
         self._p4_comp_snapshot = snap
+        # Vessel locations changed since the last auction; invalidate forecasts.
+        self._p4_future_context.clear()
 
     def find_closest_competitor_vessels(self, trade):
         """{company name: (vessel, distance NM to trade origin)} for every competitor."""
@@ -1559,78 +1568,141 @@ class FuturePlanningMixin:
             self.snapshot_competitors()
         out = {}
         for name, vessels in self._p4_comp_snapshot.items():
-            costs = [self._p4_standalone_cost(v, trade, loc)
-                     for v, loc in vessels if self._p4_can_carry(v, trade)]
-            costs = [c for c in costs if c != float("inf")]
+            costs = []
+            for v, loc in vessels:
+                try:
+                    if not self._p4_can_carry(v, trade):
+                        continue
+                    value = float(self._p4_standalone_cost(v, trade, loc))
+                    if math.isfinite(value) and value > 0:
+                        costs.append(value)
+                except (TypeError, ValueError, AttributeError, OverflowError):
+                    # An unusual competitor vessel must not break our bids.
+                    continue
             if costs:
                 out[name] = min(costs)
         return out
 
     # ================================================ future-opportunity score
-    def future_trade_bonus(self, vessel, trade, cost=None, schedule=None):
-        """£ value of `vessel` ending at trade.destination_port, because of next
-        month's cargoes.
+    def _p4_future_baseline(self, future):
+        """Cheapest *compatible vessel's* empty repositioning cost to future.
 
-        For each future trade f:
-          baseline = cheapest ballast from ANY of our vessels' current end points to f
-                     (if another ship of ours is already close, repositioning this
-                     one adds little)
-          new      = ballast from trade.destination_port to f, by this vessel
-          saving   = max(0, baseline - new)
-          p_win    = rough chance we win f, from how close the nearest competitor is
-        Bonus = FUTURE_WEIGHT * sum of the top-K (p_win * saving), with decay, capped
-        at FUTURE_CAP_FRACTION * cost.
+        The old version minimised distance then charged the selected ship's
+        fuel rate to that distance. That can badly overstate savings when our
+        ships differ in fuel efficiency or cargo compatibility.
+        """
+        self._p4_init()
+        key = self._p4_key(future)
+        if key in self._p4_future_context:
+            return self._p4_future_context[key]
+        baseline = float("inf")
+        for candidate in self.fleet:
+            try:
+                if not self._p4_can_carry(candidate, future):
+                    continue
+                distance = self._p4_distance(
+                    self._p4_end_location(candidate), future.origin_port,
+                )
+                value = float(self._p4_ballast_cost(candidate, distance))
+                if math.isfinite(value) and value >= 0:
+                    baseline = min(baseline, value)
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                continue
+        # Use pre-auction opponent positions only as a conservative proxy;
+        # these are NOT live positions at next month's auction.
+        try:
+            competitor_costs = self.competitor_costs(future)
+            rival_cost = min(competitor_costs.values(), default=None)
+            rival_distances = self.find_closest_competitor_vessels(future)
+            rival_distance = min((d for _, d in rival_distances.values()),
+                                 default=float("inf"))
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            rival_cost = None
+            rival_distance = float("inf")
+        context = baseline, rival_cost, rival_distance
+        self._p4_future_context[key] = context
+        return context
+
+    def future_trade_bonus(self, vessel, trade, cost=None, schedule=None):
+        """Conservative value of reaching a useful port for a *future* auction.
+
+        AAMAS-style robust pricing motivates not relying on one optimistic
+        scenario. Here an opportunity is valued at plausible repositioning
+        savings times a conservative chance of winning that future request.
+        Both relative voyage *cost* and distance have to favour us; neither
+        noisy second-price observations nor unverified future revenue enters
+        the bid. This is an adaptation, not an algorithm from the paper.
         """
         self._p4_init()
         if not self._future_trades:
-            return 0.0  # last month, or pre_inform not called yet
-
-        end_time = None
-        if schedule is not None:
-            try:
-                end_time = schedule.completion_time()
-            except Exception:
-                end_time = None
+            return 0.0
+        try:
+            end_time = schedule.completion_time() if schedule is not None else None
+        except (TypeError, ValueError, AttributeError):
+            end_time = None
 
         values = []
-        for f in self._future_trades:
-            if not self._p4_can_carry(vessel, f):
-                continue
-            new_d = self._p4_distance(trade.destination_port, f.origin_port)
-            if new_d == float("inf"):
-                continue
-
-            # Rough time check: can we reach f's pickup in time?
-            if end_time is not None and f.latest_pickup is not None:
-                if end_time + vessel.get_travel_time(new_d) > f.latest_pickup:
+        for future in self._future_trades:
+            try:
+                if not self._p4_can_carry(vessel, future):
+                    continue
+                distance = self._p4_distance(trade.destination_port,
+                                             future.origin_port)
+                if not math.isfinite(distance):
+                    continue
+                if end_time is not None:
+                    latest = getattr(future, "latest_pickup", None)
+                    if latest is not None and (end_time + vessel.get_travel_time(distance) > latest):
+                        continue
+                baseline, rival_cost, rival_distance = self._p4_future_baseline(future)
+                if not math.isfinite(baseline):
+                    # Unknown baseline isn't evidence of an opportunity.
+                    continue
+                new_ballast = float(self._p4_ballast_cost(vessel, distance))
+                saving = baseline - new_ballast
+                if not math.isfinite(saving) or saving <= 0:
                     continue
 
-            base_d = min(self._p4_distance(self._p4_end_location(v), f.origin_port)
-                         for v in self.fleet)
-            if base_d == float("inf"):
-                base_d = new_d * 2  # nothing of ours can currently reach it
-            saving = (self._p4_ballast_cost(vessel, base_d)
-                      - self._p4_ballast_cost(vessel, new_d))
-            if saving <= 0:
+                if rival_cost is None or not math.isfinite(rival_distance):
+                    # No comparable rival is observable, but their future
+                    # deployment is still uncertain: don't assume a 90% win.
+                    p_win = 0.45
+                else:
+                    our_future_cost = float(self._p4_standalone_cost(
+                        vessel, future, start_location=trade.destination_port,
+                    ))
+                    if not math.isfinite(our_future_cost) or our_future_cost < 0:
+                        continue
+                    # Both proxies are monotone: lower cost / shorter empty
+                    # journeys improve competitiveness. Taking the minimum
+                    # guards against overconfidence in either alone.
+                    cost_advantage = rival_cost / max(1e-9, rival_cost + our_future_cost)
+                    distance_advantage = rival_distance / max(
+                        1e-9, rival_distance + distance,
+                    )
+                    p_win = min(cost_advantage, distance_advantage)
+                    p_win = max(0.05, min(0.70, p_win))
+                values.append(p_win * saving)
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                # The future opportunity is optional: never block real bids.
                 continue
-
-            comp = self.find_closest_competitor_vessels(f)
-            comp_d = min((d for _, d in comp.values()), default=float("inf"))
-            if comp_d == float("inf"):
-                p_win = 0.9
-            else:
-                p_win = comp_d / (comp_d + new_d + 1e-9)  # closer than them -> >0.5
-                p_win = min(0.9, max(0.1, p_win))
-            values.append(p_win * saving)
 
         if not values:
             return 0.0
         values.sort(reverse=True)
-        total = sum(v * (self.FUTURE_DECAY ** i)
-                    for i, v in enumerate(values[: self.FUTURE_TOP_K]))
-        bonus = self.FUTURE_WEIGHT * total
-        if cost is not None and cost > 0:
-            bonus = min(bonus, self.FUTURE_CAP_FRACTION * cost)
+        credible_saving = sum(
+            value * self.FUTURE_DECAY ** index
+            for index, value in enumerate(values[:self.FUTURE_TOP_K])
+        )
+        bonus = max(0.0, self.FUTURE_WEIGHT * credible_saving)
+        if cost is not None:
+            try:
+                current_cost = float(cost)
+                if not math.isfinite(current_cost) or current_cost <= 0:
+                    return 0.0
+                bonus = min(bonus, self.FUTURE_CAP_FRACTION * current_cost)
+            except (TypeError, ValueError):
+                return 0.0
         return float(bonus)
 
     # =================================== Lab 3 Ex 3: auction-outcome analysis
@@ -1683,6 +1755,20 @@ class FuturePlanningMixin:
                 if name == self.name:
                     if ours and ours[0] > 0:
                         self._p4_won.append(payment / ours[0])
+                    # When WE win a reverse second-price auction, payment is
+                    # the lowest competing bid. Learn its scale from those
+                    # outcomes only. A rival's payment is NOT its own bid.
+                    try:
+                        competitors = self.competitor_costs(trade)
+                        cheapest = min(competitors.values(), default=None)
+                        realised = float(payment)
+                        if cheapest is not None and cheapest > 0 and realised > 0:
+                            ratio = realised / cheapest
+                            if math.isfinite(ratio) and 0.1 <= ratio <= 10.0:
+                                self._p4_second_price_ratios.append(ratio)
+                                del self._p4_second_price_ratios[:-80]
+                    except (TypeError, ValueError, OverflowError, AttributeError):
+                        pass
                     forecast = self._p4_price_predictions.get(key)
                     if forecast is not None:
                         predicted, _predicted_competitor = forecast
@@ -1727,10 +1813,12 @@ class FuturePlanningMixin:
             logger.info(
                 "P4_CALIBRATION: observed_wins={} total_samples={} "
                 "median_observed_over_predicted={:.3f} median_abs_pct_error={:.1f}% "
+                "second_price_samples={} second_price_cost_factor={:.3f} "
                 "(diagnostic_only=True)",
                 round_price_samples, len(self._p4_price_ratios),
                 self.market_price_calibration(),
                 100.0 * statistics.median(self._p4_price_ape),
+                len(self._p4_second_price_ratios), self._p4_second_price_factor(),
             )
 
     def competitor_factor(self, name):
@@ -1747,15 +1835,40 @@ class FuturePlanningMixin:
             return statistics.median(self._p4_market_ratios)
         return self.DEFAULT_MARKET_FACTOR
 
+    def _p4_second_price_factor(self):
+        """Shrunk robust multiplier learned from our own second-price wins.
+
+        Start with a prior rather than jumping to a multiplier from just one
+        auction. Wins are selected samples, so even with history the estimate
+        stays conservative and is for diagnostics only.
+        """
+        self._p4_init()
+        samples = self._p4_second_price_ratios
+        if len(samples) < self.MIN_SAMPLES:
+            return self.DEFAULT_MARKET_FACTOR
+        # The median in log space reduces the influence of very large prices;
+        # the bounded weight avoids overfitting a few won contracts.
+        logs = [math.log(value) for value in samples if value > 0]
+        if not logs:
+            return self.DEFAULT_MARKET_FACTOR
+        weight = min(0.75, len(logs) / (len(logs) + 8.0))
+        learned = math.exp(
+            (1.0 - weight) * math.log(self.DEFAULT_MARKET_FACTOR)
+            + weight * statistics.median(logs)
+        )
+        return max(0.5, min(2.0, learned))
+
     def estimated_competitor_bid(self, trade):
-        """(lowest predicted competitor bid, company name). This approximates what we
-        would be paid if we win, because the auction is second-price."""
-        best, who = None, None
-        for name, c in self.competitor_costs(trade).items():
-            b = c * self.competitor_factor(name)
-            if best is None or b < best:
-                best, who = b, name
-        return best, who
+        """Forecast cheapest rival bid, based on our own second-price wins.
+
+        Diagnostic only: do not feed uncertain market-price predictions
+        straight into submitted bids or speculative future discounts.
+        """
+        costs = self.competitor_costs(trade)
+        if not costs:
+            return None, None
+        who = min(costs, key=costs.get)
+        return costs[who] * self._p4_second_price_factor(), who
 
     def expected_profit(self, trade, our_cost):
         """Predicted payment minus our cost (None if no competitor can carry it)."""
@@ -1780,6 +1893,8 @@ class FuturePlanningMixin:
                                       if self._p4_won else None),
             "lost_payment_over_cost": (round(self.lost_margin_hint(), 3)
                                        if self._p4_lost else None),
+            "second_price_samples": len(self._p4_second_price_ratios),
+            "second_price_cost_factor": round(self._p4_second_price_factor(), 3),
             "price_calibration_samples": len(self._p4_price_ratios),
             "price_calibration_factor": round(self.market_price_calibration(), 3),
             "price_median_absolute_percentage_error": (
@@ -1827,6 +1942,12 @@ RANDOM_SEED = 6203
 # by AAMAS consolidation efficiency with a modest penalty for NEW empty
 # repositioning. 0.25 is an experimental weight, not a paper-prescribed value.
 BALLAST_PENALTY_WEIGHT = 0.25
+# Experimental, bounded quality weighting of the *already feasible* top-K
+# pre-auction plans. Better consolidated / lower-ballast routes contribute more
+# to trade frequency and shared-cost estimates, without excluding diversity.
+# This is inspired by AAMAS plan ranking, NOT the paper's exact probability rule.
+PLAN_QUALITY_STRENGTH = 1.00
+PLAN_MIN_RELATIVE_WEIGHT = 0.50
 
 
 @dataclass
@@ -1859,6 +1980,7 @@ class BiddingStrategy:
         self.seed = int(seed)
         self._distance_cache = {}
         self.ballast_penalty_weight = BALLAST_PENALTY_WEIGHT
+        self.plan_quality_strength = PLAN_QUALITY_STRENGTH
         self._baseline_ballast_cache = {}  # key is live vessel identity, one auction round
 
     def _rank_score(self, plan):
@@ -1868,6 +1990,33 @@ class BiddingStrategy:
         Live committed ballast is not charged again for each proposed plan.
         """
         return plan.efficiency - self.ballast_penalty_weight * plan.ballast_fraction
+
+    def _plan_weights(self, plans):
+        """Give higher-quality plans more influence, without discarding diversity.
+
+        Scores are AAMAS-inspired consolidation efficiency minus the existing
+        incremental-ballast penalty. Exponential weights depend on the actual
+        quality gap, not arbitrary ranking positions. A 50% raw-weight floor
+        prevents a single exploratory plan from being effectively ignored.
+        Normalise to mean weight 1.0; equal scores preserve old frequency and
+        allocated-cost calculations exactly, as does having only one plan.
+        """
+        if not plans:
+            return []
+        scores = [self._rank_score(plan) for plan in plans]
+        if not all(math.isfinite(score) for score in scores):
+            logger.warning("PRE_PLAN_WEIGHTS: invalid plan score; using equal weights")
+            return [1.0] * len(plans)
+        best = max(scores)
+        raw = [
+            max(
+                PLAN_MIN_RELATIVE_WEIGHT,
+                math.exp(-min(20.0, max(0.0, self.plan_quality_strength * (best - score)))),
+            )
+            for score in scores
+        ]
+        normaliser = len(raw) / sum(raw)
+        return [weight * normaliser for weight in raw]
 
     def _distance(self, a, b):
         if a is None or b is None:
@@ -2132,14 +2281,30 @@ class BiddingStrategy:
         if not plans:
             logger.warning("Bidding: no evaluable feasible plans; no bids")
             return []
-        frequencies = Counter()
-        allocated_sums = defaultdict(float)
-        vessel_votes = defaultdict(Counter)
-        for plan in plans:
-            for trade_id, vessel in plan.assignments.items():
-                frequencies[trade_id] += 1
-                allocated_sums[trade_id] += plan.allocation[trade_id]
-                vessel_votes[trade_id][vessel] += 1
+        # Prefer the strongest feasible plans when measuring trade appearance
+        # probability and its expected AAMAS-style shared route allocation.
+        # A poor exploratory plan can still vote, but its vote is weaker.
+        plan_weights = self._plan_weights(plans)
+        total_weight = sum(plan_weights)
+        weighted_presence = defaultdict(float)
+        weighted_allocations = defaultdict(float)
+        for plan, weight in zip(plans, plan_weights):
+            for trade_id in plan.assignments:
+                weighted_presence[trade_id] += weight
+                weighted_allocations[trade_id] += weight * plan.allocation[trade_id]
+        probabilities = {
+            id(trade): weighted_presence[id(trade)] / total_weight
+            for trade in trades
+        }
+        if getattr(self.company, "enable_diagnostics", True):
+            logger.info(
+                "PRE_PLAN_WEIGHTS: plans={} score_best={:.3f} score_worst={:.3f} "
+                "weight_best={:.3f} weight_worst={:.3f} effective_plans={:.2f}",
+                len(plans), max(self._rank_score(p) for p in plans),
+                min(self._rank_score(p) for p in plans),
+                max(plan_weights), min(plan_weights),
+                total_weight ** 2 / sum(w ** 2 for w in plan_weights),
+            )
         # Robustness extension of AAMAS pre-scheduling: select a *single*
         # verified candidate route plan that covers the largest number of
         # frequency-eligible trades. The submitted set is then a subset of
@@ -2148,18 +2313,38 @@ class BiddingStrategy:
         # but avoids one source of bid-set incompatibility.
         eligible_ids = {
             id(trade) for trade in trades
-            if frequencies[id(trade)]
-            and frequencies[id(trade)] / len(plans) >= self.p_select
+            if weighted_presence[id(trade)] > 0
+            and probabilities[id(trade)] + 1e-12 >= self.p_select
         }
         anchor = max(
             plans,
             key=lambda p: (
+                # Primary: maximise the number of *jointly feasible* bids.
                 sum(key in p.assignments for key in eligible_ids),
+                # Secondary: favour the most robust trade combination.
+                sum(probabilities[key] for key in eligible_ids if key in p.assignments),
                 self._rank_score(p),
             ),
         )
+        if getattr(self.company, "enable_diagnostics", True):
+            # Compare the candidate set against the previous equal-vote method.
+            # This reveals whether weighting actually changed auction decisions.
+            uniform_counts = Counter(
+                trade_id for plan in plans for trade_id in plan.assignments
+            )
+            uniform_ids = {
+                id(trade) for trade in trades
+                if uniform_counts[id(trade)] / len(plans) + 1e-12 >= self.p_select
+            }
+            logger.info(
+                "PRE_PLAN_SELECTION: weighted_eligible={} uniform_eligible={} "
+                "promoted={} suppressed={} anchor_coverage={}",
+                len(eligible_ids), len(uniform_ids),
+                len(eligible_ids - uniform_ids), len(uniform_ids - eligible_ids),
+                sum(key in anchor.assignments for key in eligible_ids),
+            )
         logger.info(
-            "Bidding: {} frequency-eligible trades; {} jointly represented "
+            "Bidding: {} quality-weighted eligible trades; {} jointly represented "
             "by anchor plan",
             len(eligible_ids),
             sum(key in anchor.assignments for key in eligible_ids),
@@ -2175,7 +2360,7 @@ class BiddingStrategy:
             vessel = anchor.assignments[key]
             try:
                 absolute = self._dedicated_cost(vessel, trade)
-                marginal = allocated_sums[key] / frequencies[key]
+                marginal = weighted_allocations[key] / weighted_presence[key]
                 # Person 3's base valuation, prior to future-opportunity adjustment.
                 base_cost = max(MIN_BID, 0.5 * (absolute + marginal))
                 if not math.isfinite(base_cost):
