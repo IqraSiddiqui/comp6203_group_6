@@ -472,8 +472,9 @@ def _get_initial_cargo(vessel):
 def estimate_schedule_cost(
     vessel,
     schedule,
-    headquarters=None
-) -> float:
+    headquarters=None,
+    return_breakdown=False,
+):
     """
     Estimate the total cost of carrying out a complete vessel schedule.
 
@@ -522,9 +523,19 @@ def estimate_schedule_cost(
         )
 
     events = get_simple_schedule()
-
+    # Optional diagnostics: identical calculations, just tagged by activity.
+    components = {
+        "ballast": 0.0,
+        "laden": 0.0,
+        "loading": 0.0,
+        "unloading": 0.0,
+        "idle": 0.0,
+        "ballast_hours": 0.0,
+        "laden_hours": 0.0,
+        "idle_hours": 0.0,
+    }
     if not events:
-        return 0.0
+        return dict(components, total=0.0) if return_breakdown else 0.0
 
     # Prefer an attached simulation engine, but real TradingCompany agents
     # commonly expose routing through headquarters instead.
@@ -628,6 +639,8 @@ def estimate_schedule_cost(
         )
 
         total_cost += travel_cost
+        components["laden" if is_laden else "ballast"] += travel_cost
+        components["laden_hours" if is_laden else "ballast_hours"] += travel_time
         current_time += travel_time
         current_location = destination
 
@@ -647,6 +660,8 @@ def estimate_schedule_cost(
             )
 
             total_cost += waiting_cost
+            components["idle"] += waiting_cost
+            components["idle_hours"] += waiting_time
             current_time = earliest_time
 
         # Calculate cargo transfer cost.
@@ -665,6 +680,7 @@ def estimate_schedule_cost(
             )
 
         total_cost += transfer_cost
+        components["loading" if is_pickup else "unloading"] += transfer_cost
         current_time += transfer_time
 
         # Update cargo onboard after the event.
@@ -700,10 +716,11 @@ def estimate_schedule_cost(
             else:
                 cargo_onboard.pop(cargo_type, None)
 
-    return _check_number(
-        total_cost,
-        "Total schedule cost"
-    )
+    validated_total = _check_number(total_cost, "Total schedule cost")
+    if return_breakdown:
+        # These are model-estimated costs, not realised simulator fuel expenses.
+        return dict(components, total=validated_total)
+    return validated_total
 
 
 # 11. MARGINAL COST
@@ -803,6 +820,7 @@ class PlanningResult:
     scheduled_trades: list = field(default_factory=list)  # inserted Trade objects
     costs: dict = field(default_factory=dict)            # trade -> sequential marginal cost
     total_extra_cost: float = 0.0
+    assignments: dict = field(default_factory=dict)  # newly awarded trade -> vessel
 
 
 class SchedulingOptimizer:
@@ -821,7 +839,8 @@ class SchedulingOptimizer:
 
     def __init__(self, fleet, cost_fn=None, restarts=8,
                  time_budget_s=8.0, seed=42, penalty_fn=None,
-                 post_rcl_size=3):
+                 post_rcl_size=3, local_search_passes=2,
+                 local_search_max_moves=8):
         self.fleet = list(fleet)
         if cost_fn is not None and not callable(cost_fn):
             raise TypeError("cost_fn must be callable or None")
@@ -830,6 +849,8 @@ class SchedulingOptimizer:
         self.cost_fn = cost_fn
         self.penalty_fn = penalty_fn
         self.post_rcl_size = max(1, int(post_rcl_size))
+        self.local_search_passes = max(0, int(local_search_passes))
+        self.local_search_max_moves = max(0, int(local_search_max_moves))
         self.restarts = max(1, int(restarts))
         self.time_budget_s = max(0.1, float(time_budget_s))
         self.seed = seed
@@ -897,6 +918,7 @@ class SchedulingOptimizer:
         vessel, candidate, delta = choice
         result.schedules[vessel] = candidate
         result.scheduled_trades.append(trade)
+        result.assignments[trade] = vessel
         result.total_extra_cost += delta
         if self.cost_fn is not None:
             result.costs[trade] = delta
@@ -912,6 +934,84 @@ class SchedulingOptimizer:
             )
             if best is not None:
                 self._assign(result, trade, best)
+        return result
+
+    def sample_preauction_plan(self, order, deadline, *, seed=0, run_id=1,
+                               max_choices=4, cost_slack=0.60,
+                               cost_floor=25.0):
+        """Sample a *different*, fully verified pre-auction insertion plan.
+
+        The normal ``plan()`` deliberately returns the cheapest/most-covered
+        restart, which collapses randomized insertion runs to the same plan.
+        This method instead retains a bounded set of feasible alternatives
+        for each incoming trade (different vessels and, when possible,
+        different pickup/drop-off positions) and samples from that set.
+
+        A candidate is eligible for exploration only if its *incremental*
+        cost lies within ``max(cost_floor, cost_slack * abs(best_cost))``
+        of the cheapest move. Existing live schedules are never modified.
+        The method is pre-auction only; post-auction commitments continue to
+        use the original income/penalty-aware ``plan()`` algorithm.
+        """
+        rng = Random(seed)
+        result = PlanningResult()
+        for step, trade in enumerate(order):
+            if monotonic() >= deadline:
+                break
+            best_by_vessel = []
+            second_by_vessel = []
+            for vessel in self.fleet:
+                if monotonic() >= deadline:
+                    break
+                base = result.schedules.get(vessel, vessel.schedule)
+                base_cost = self._cost(vessel, base) if self.cost_fn else 0.0
+                # Keep at most two *structurally distinct* placements per
+                # vessel, rather than choosing the same cheapest route on
+                # every restart. MABLE validates each copied schedule.
+                candidates = []
+                seen = set()
+                for candidate in self._candidates(base, trade, append_only=False):
+                    if monotonic() >= deadline:
+                        break
+                    signature = tuple(
+                        (getattr(kind, "name", kind), id(t))
+                        for kind, t in candidate.get_simple_schedule()
+                    )
+                    if signature in seen:
+                        continue
+                    seen.add(signature)
+                    extra = (self._cost(vessel, candidate) - base_cost
+                             if self.cost_fn else 0.0)
+                    if not isfinite(extra):
+                        continue
+                    candidates.append((vessel, candidate, extra))
+                    candidates.sort(key=lambda choice: choice[2])
+                    if len(candidates) > 2:
+                        candidates.pop()
+                if candidates:
+                    best_by_vessel.append(candidates[0])
+                if len(candidates) > 1:
+                    second_by_vessel.append(candidates[1])
+
+            if not best_by_vessel:
+                continue
+            best_by_vessel.sort(key=lambda choice: choice[2])
+            cheapest = best_by_vessel[0][2]
+            ceiling = cheapest + max(float(cost_floor),
+                                     float(cost_slack) * abs(cheapest))
+            primary = [move for move in best_by_vessel if move[2] <= ceiling]
+            secondary = [move for move in second_by_vessel if move[2] <= ceiling]
+            secondary.sort(key=lambda choice: choice[2])
+            pool = (primary + secondary)[:max(1, int(max_choices))]
+            if step == 0:
+                # Different run IDs explore different vessel assignments at
+                # the first opportunity, even when trade order is the same.
+                selected = primary[(run_id - 1) % len(primary)]
+            elif len(pool) > 1 and rng.random() < 0.55:
+                selected = rng.choice(pool[1:])
+            else:
+                selected = pool[0]
+            self._assign(result, trade, selected)
         return result
 
     def _post_auction_run(self, order, payments, deadline,
@@ -992,6 +1092,190 @@ class SchedulingOptimizer:
         return (proxy_income, len(result.scheduled_trades),
                 -result.total_extra_cost)
 
+    def _route_order(self, result, vessel):
+        """Newly awarded trades in pickup order; existing commitments stay fixed.
+
+        Only trades in ``result.assignments`` may move. Existing vessel.schedule
+        events are never removed or edited during local search.
+        """
+        owned = {t for t, v in result.assignments.items() if v is vessel}
+        if not owned:
+            return []
+        ordered = []
+        try:
+            schedule = result.schedules.get(vessel, vessel.schedule)
+            for kind, trade in schedule.get_simple_schedule():
+                name = getattr(kind, "name", kind)
+                if name == "PICK_UP" and trade in owned and trade not in ordered:
+                    ordered.append(trade)
+        except (AttributeError, ValueError, TypeError):
+            pass
+        # Some mock schedules have a different event representation. Preserve
+        # their original insertion order rather than inferring a wrong route.
+        ordered.extend(t for t in result.scheduled_trades
+                       if t in owned and t not in ordered)
+        return ordered
+
+    def _rebuild_vessel(self, vessel, ordered_trades, deadline):
+        """Reinsert *new* trades on a copy of the unchanged live schedule.
+
+        Return (schedule, marginal_cost, per_trade_marginals), or None when
+        time expires or one of the insertions cannot be verified by MABLE.
+        """
+        if monotonic() >= deadline:
+            return None
+        trial = vessel.schedule.copy()
+        original_cost = self._cost(vessel, trial)
+        previous_cost = original_cost
+        trade_costs = {}
+        for trade in ordered_trades:
+            if monotonic() >= deadline:
+                return None
+            cheapest = None
+            for candidate in self._candidates(trial, trade, append_only=False):
+                if monotonic() >= deadline:
+                    return None
+                candidate_cost = self._cost(vessel, candidate)
+                if cheapest is None or candidate_cost < cheapest[1]:
+                    cheapest = (candidate, candidate_cost)
+            if cheapest is None:
+                return None
+            trial, current_cost = cheapest
+            trade_costs[trade] = current_cost - previous_cost
+            previous_cost = current_cost
+        return trial, previous_cost - original_cost, trade_costs
+
+    def _apply_local_move(self, result, changes, new_assignments):
+        """Create a new plan; never mutate the current best or live schedules."""
+        updated = PlanningResult(
+            schedules=dict(result.schedules),
+            scheduled_trades=list(result.scheduled_trades),
+            costs=dict(result.costs),
+            total_extra_cost=result.total_extra_cost,
+            assignments=dict(result.assignments),
+        )
+        old_sum = 0.0
+        new_sum = 0.0
+        for vessel, (schedule, delta, per_trade) in changes.items():
+            old_schedule = result.schedules.get(vessel, vessel.schedule)
+            old_sum += self._cost(vessel, old_schedule) - self._cost(vessel, vessel.schedule)
+            new_sum += delta
+            # No newly awarded trades remain on this vessel: keep the original
+            # vessel schedule rather than submitting a redundant replacement.
+            if any(v is vessel for v in new_assignments.values()):
+                updated.schedules[vessel] = schedule
+            else:
+                updated.schedules.pop(vessel, None)
+            for trade, owner in result.assignments.items():
+                if owner is vessel:
+                    updated.costs.pop(trade, None)
+            updated.costs.update(per_trade)
+        updated.assignments = new_assignments
+        updated.total_extra_cost += new_sum - old_sum
+        return updated
+
+    def _local_improve(self, result, deadline):
+        """Bounded best-improvement-free local search on post-auction awards.
+
+        Try single-trade transfers between vessels and adjacent pickup-order
+        swaps on a vessel. Rebuild affected routes with feasible insertion,
+        accepting only strict marginal-cost reductions with unchanged contract
+        coverage. No speculative edits to current vessel.schedule are made.
+        """
+        if (self.cost_fn is None or self.local_search_passes == 0
+                or self.local_search_max_moves == 0 or not result.assignments):
+            return result
+        start_cost = result.total_extra_cost
+        accepted = 0
+        candidates_tested = 0
+        feasible_candidates = 0
+        for _ in range(self.local_search_passes):
+            if monotonic() >= deadline or accepted >= self.local_search_max_moves:
+                break
+            improved = False
+            orders = {v: self._route_order(result, v) for v in self.fleet}
+            # High-costly awarded trades are examined first, but never dropped.
+            trades = sorted(result.assignments,
+                            key=lambda t: result.costs.get(t, 0.0), reverse=True)
+            for trade in trades:
+                if monotonic() >= deadline:
+                    break
+                src = result.assignments[trade]
+                src_order = [t for t in orders[src] if t != trade]
+                src_rebuilt = self._rebuild_vessel(src, src_order, deadline)
+                if src_rebuilt is None:
+                    continue
+                for dst in self.fleet:
+                    if monotonic() >= deadline:
+                        break
+                    if dst is src:
+                        continue
+                    dst_order = orders[dst]
+                    # Both insertion orders can produce different feasible
+                    # consolidated routes even though each uses best insertion.
+                    variants = [dst_order + [trade]]
+                    if dst_order:
+                        variants.append([trade] + dst_order)
+                    for order in variants:
+                        candidates_tested += 1
+                        rebuilt = self._rebuild_vessel(dst, order, deadline)
+                        if rebuilt is None:
+                            continue
+                        feasible_candidates += 1
+                        candidate_assignments = dict(result.assignments)
+                        candidate_assignments[trade] = dst
+                        proposed = self._apply_local_move(
+                            result, {src: src_rebuilt, dst: rebuilt},
+                            candidate_assignments,
+                        )
+                        if proposed.total_extra_cost < result.total_extra_cost - 1e-6:
+                            result = proposed
+                            accepted += 1
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if not improved:
+                # Within-vessel reorder: swap adjacent pickup order and find
+                # a new minimum-cost insertion plan on that vessel.
+                for vessel, order in orders.items():
+                    if monotonic() >= deadline:
+                        break
+                    for idx in range(len(order) - 1):
+                        swapped = order.copy()
+                        swapped[idx], swapped[idx + 1] = swapped[idx + 1], swapped[idx]
+                        candidates_tested += 1
+                        rebuilt = self._rebuild_vessel(vessel, swapped, deadline)
+                        if rebuilt is None:
+                            continue
+                        feasible_candidates += 1
+                        proposed = self._apply_local_move(
+                            result, {vessel: rebuilt}, dict(result.assignments),
+                        )
+                        if proposed.total_extra_cost < result.total_extra_cost - 1e-6:
+                            result = proposed
+                            accepted += 1
+                            improved = True
+                            break
+                    if improved:
+                        break
+            if not improved:
+                break
+        # This runs only after awards; Person 4's future bid bonus and
+        # pre-auction bidding plans are entirely unchanged. Zero accepted
+        # moves is also logged so the local run is visible in MABLE logs.
+        logger.info(
+            "LOCAL_SEARCH: accepted_moves={} candidates_tested={} "
+            "feasible_candidates={} incremental_cost_before={:.2f} "
+            "incremental_cost_after={:.2f} saving={:.2f} time_exhausted={}",
+            accepted, candidates_tested, feasible_candidates,
+            start_cost, result.total_extra_cost,
+            start_cost - result.total_extra_cost, monotonic() >= deadline,
+        )
+        return result
+
     def plan(self, trades, payments=None):
         """Return the best verified plan found within the time budget.
 
@@ -1002,11 +1286,18 @@ class SchedulingOptimizer:
         if not trades:
             return PlanningResult()
         deadline = monotonic() + self.time_budget_s
+        # Reserve modest time for post-auction route improvement. Pre-auction
+        # planning and short-budget unit tests retain their original budgets.
+        do_local = (payments is not None and self.cost_fn is not None
+                    and len(trades) >= 2 and self.time_budget_s >= 3.0
+                    and self.local_search_passes > 0 and self.local_search_max_moves > 0)
+        local_reserve = min(1.5, 0.10 * self.time_budget_s) if do_local else 0.0
+        construction_deadline = deadline - local_reserve
         rng = Random(self.seed)
         penalties = self._penalty_estimates(trades) if payments is not None else None
 
         # Preserve a quick feasible fallback (no penalty-driven omissions).
-        best = self._one_run(trades, deadline, append_only=True)
+        best = self._one_run(trades, construction_deadline, append_only=True)
         orders = [trades.copy()]
         if self.restarts >= 2:
             orders.append(sorted(trades, key=self._latest_pickup))
@@ -1019,13 +1310,13 @@ class SchedulingOptimizer:
             orders.append(shuffled)
 
         for run, order in enumerate(orders[:self.restarts]):
-            if monotonic() >= deadline:
+            if monotonic() >= construction_deadline:
                 break
             if payments is None:
-                candidate = self._one_run(order, deadline, append_only=False)
+                candidate = self._one_run(order, construction_deadline, append_only=False)
             else:
                 candidate = self._post_auction_run(
-                    order, payments, deadline, penalties=penalties,
+                    order, payments, construction_deadline, penalties=penalties,
                     rng=rng, rcl_size=(1 if run == 0 else self.post_rcl_size),
                 )
             if self._quality(candidate, payments, penalties, trades) > \
@@ -1036,11 +1327,11 @@ class SchedulingOptimizer:
         # commitments, and never worsen a feasible full-coverage result.
         assigned = set(best.scheduled_trades)
         for trade in trades:
-            if monotonic() >= deadline:
+            if monotonic() >= construction_deadline:
                 break
             if trade in assigned:
                 continue
-            choice = self.best_insertion(trade, best.schedules, deadline)
+            choice = self.best_insertion(trade, best.schedules, construction_deadline)
             if choice is None:
                 continue
             # A positive expected penalty-saving justifies this insertion;
@@ -1051,8 +1342,9 @@ class SchedulingOptimizer:
                 continue
             self._assign(best, trade, choice)
             assigned.add(trade)
+        if do_local and monotonic() < deadline:
+            best = self._local_improve(best, deadline)
         return best
-
 # ================== END scheduler.py ==================
 
 
@@ -1134,6 +1426,12 @@ class FuturePlanningMixin:
         self._p4_our_bids = {}            # trade key -> (our cost, our bid)
         self._p4_lost = []                # (payment / our cost) on trades we lost
         self._p4_won = []                 # (payment / our cost) on trades we won
+        # Predictions made *before* a round, evaluated against realised
+        # second-price payments on OUR wins only. An opponent-win payment
+        # is the runner-up bid, not the price we would have received.
+        self._p4_price_predictions = {}  # trade key -> (raw forecast, opponent name)
+        self._p4_price_ratios = []        # realised payment / raw forecast
+        self._p4_price_ape = []           # absolute percentage error (realised denominator)
 
     # ======================================================== pre_inform
     def pre_inform(self, trades, time):
@@ -1341,6 +1639,29 @@ class FuturePlanningMixin:
         self._p4_init()
         self._p4_our_bids[self._p4_key(trade)] = (cost, bid)
 
+    def record_market_prediction(self, trade, predicted, competitor=None):
+        """Save a pre-auction price prediction for diagnostics, not bid selection."""
+        self._p4_init()
+        if predicted is None:
+            return
+        try:
+            value = float(predicted)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(value) and value > 0:
+            self._p4_price_predictions[self._p4_key(trade)] = (value, competitor)
+
+    def market_price_calibration(self):
+        """Robust retrospective correction; NOT applied to submitted bids.
+
+        At least MIN_SAMPLES observed wins are needed to avoid reacting to one
+        noisy auction. The rolling median resists extreme ratios.
+        """
+        self._p4_init()
+        ratios = self._p4_price_ratios
+        return (statistics.median(ratios)
+                if len(ratios) >= self.MIN_SAMPLES else 1.0)
+
     def update_opponent_models(self, auction_ledger):
         """Person 2: call at the start of receive(contracts, auction_ledger=None, ...).
 
@@ -1348,7 +1669,11 @@ class FuturePlanningMixin:
         """
         self._p4_init()
         if not auction_ledger:
+            # Keep earlier samples and wait for a usable ledger.
+            self._p4_price_predictions.clear()
+            self._p4_our_bids.clear()
             return
+        round_price_samples = 0
         for name, contracts in auction_ledger.items():
             for c in contracts or []:
                 trade, payment = c.trade, c.payment
@@ -1358,6 +1683,28 @@ class FuturePlanningMixin:
                 if name == self.name:
                     if ours and ours[0] > 0:
                         self._p4_won.append(payment / ours[0])
+                    forecast = self._p4_price_predictions.get(key)
+                    if forecast is not None:
+                        predicted, _predicted_competitor = forecast
+                        try:
+                            realised = float(payment)
+                            ratio = realised / predicted
+                            if (math.isfinite(realised) and realised > 0
+                                    and math.isfinite(ratio) and 0.02 <= ratio <= 50.0):
+                                self._p4_price_ratios.append(ratio)
+                                self._p4_price_ape.append(abs(predicted - realised) / realised)
+                                # Bounded memory and stable per-round processing.
+                                del self._p4_price_ratios[:-100]
+                                del self._p4_price_ape[:-100]
+                                round_price_samples += 1
+                                logger.info(
+                                    "P4_PRICE_AUDIT: predicted={:.2f} realised={:.2f} "
+                                    "ratio={:.3f} abs_pct_error={:.1f}%",
+                                    predicted, realised, ratio,
+                                    100.0 * abs(predicted - realised) / realised,
+                                )
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            pass
                     continue
 
                 # A competitor won. Estimate their cost from the pre-auction snapshot.
@@ -1375,6 +1722,16 @@ class FuturePlanningMixin:
                 if ours and ours[0] > 0:
                     self._p4_lost.append(payment / ours[0])
         self._p4_our_bids = {}
+        self._p4_price_predictions = {}
+        if round_price_samples:
+            logger.info(
+                "P4_CALIBRATION: observed_wins={} total_samples={} "
+                "median_observed_over_predicted={:.3f} median_abs_pct_error={:.1f}% "
+                "(diagnostic_only=True)",
+                round_price_samples, len(self._p4_price_ratios),
+                self.market_price_calibration(),
+                100.0 * statistics.median(self._p4_price_ape),
+            )
 
     def competitor_factor(self, name):
         """Learned payment/cost factor for one competitor (median, robust to outliers)."""
@@ -1423,6 +1780,12 @@ class FuturePlanningMixin:
                                       if self._p4_won else None),
             "lost_payment_over_cost": (round(self.lost_margin_hint(), 3)
                                        if self._p4_lost else None),
+            "price_calibration_samples": len(self._p4_price_ratios),
+            "price_calibration_factor": round(self.market_price_calibration(), 3),
+            "price_median_absolute_percentage_error": (
+                round(statistics.median(self._p4_price_ape), 3)
+                if self._p4_price_ape else None
+            ),
         }
 
 # ================== END future_planning.py ==================
@@ -1460,6 +1823,10 @@ PRE_TOP_K = 8
 INFORM_BUDGET_S = 12.0
 MIN_BID = 0.01
 RANDOM_SEED = 6203
+# Additional research-inspired objective: pre-auction plan diversity ranked
+# by AAMAS consolidation efficiency with a modest penalty for NEW empty
+# repositioning. 0.25 is an experimental weight, not a paper-prescribed value.
+BALLAST_PENALTY_WEIGHT = 0.25
 
 
 @dataclass
@@ -1469,6 +1836,8 @@ class _CandidatePlan:
     allocation: dict  # id(trade) -> allocated fuel cost
     coverage: int
     efficiency: float
+    ballast_delta: float = 0.0  # candidate ballast cost - live-schedule ballast cost
+    ballast_fraction: float = 0.0  # positive additional ballast / candidate route cost
 
 
 class BiddingStrategy:
@@ -1489,6 +1858,16 @@ class BiddingStrategy:
         self.time_budget_s = max(0.2, float(time_budget_s))
         self.seed = int(seed)
         self._distance_cache = {}
+        self.ballast_penalty_weight = BALLAST_PENALTY_WEIGHT
+        self._baseline_ballast_cache = {}  # key is live vessel identity, one auction round
+
+    def _rank_score(self, plan):
+        """AAMAS efficiency minus bounded incremental ballast cost pressure.
+
+        Efficient consolidation remains the dominant selection criterion.
+        Live committed ballast is not charged again for each proposed plan.
+        """
+        return plan.efficiency - self.ballast_penalty_weight * plan.ballast_fraction
 
     def _distance(self, a, b):
         if a is None or b is None:
@@ -1566,7 +1945,7 @@ class BiddingStrategy:
             + self._direct_cost(vessel, trade)
         )
 
-    def _route_allocation(self, vessel, schedule):
+    def _route_allocation(self, vessel, schedule, *, with_ballast=False):
         """Adapt Person 3's allocate(): share sailing legs among onboard cargo.
 
         Include the incoming pickup in a sailing leg's beneficiaries.
@@ -1575,6 +1954,7 @@ class BiddingStrategy:
         cost (including idling) remains the scheduling optimisation metric.
 
         Returns (total_fuel_cost, {id(trade): attributed_cost}, direct_sum).
+        With `with_ballast=True`, appends the cost of empty sailing legs.
         The allocation is an AAMAS-inspired estimate, not a guarantee of
         profitability when only part of a bundle is awarded.
         """
@@ -1588,6 +1968,7 @@ class BiddingStrategy:
         location = self._position(vessel)
         total = 0.0
         direct_sum = 0.0
+        ballast_total = 0.0
         # If a scheduled transfer is already underway, its first sailing leg
         # must not be charged again. Mirrors Person 3's first_in_progress check.
         try:
@@ -1601,6 +1982,8 @@ class BiddingStrategy:
             distance = 0.0 if (index == 0 and first_in_progress) else self._distance(location, port)
             leg_cost = self._sailing_cost(vessel, distance, bool(onboard))
             total += leg_cost
+            if not onboard:
+                ballast_total += leg_cost
             sharers = list(onboard.keys())
             if pickup and id(trade) not in sharers:
                 sharers.append(id(trade))
@@ -1619,6 +2002,8 @@ class BiddingStrategy:
             location = port
         if any(not math.isfinite(x) or x < 0 for x in [total, direct_sum, *allocation.values()]):
             raise ValueError("Non-finite or negative estimated fuel cost")
+        if with_ballast:
+            return total, allocation, direct_sum, ballast_total
         return total, allocation, direct_sum
 
     def _candidate(self, result, offered):
@@ -1629,14 +2014,25 @@ class BiddingStrategy:
         allocation = {}
         total_cost = 0.0
         direct_sum = 0.0
+        ballast_delta = 0.0
         signature = []
         for vessel in self.company.fleet:
             schedule = result.schedules.get(vessel, vessel.schedule)
             stops = self._simple_schedule(schedule)
             signature.append((id(vessel), tuple((kind, id(t)) for kind, t in stops)))
-            route_total, route_alloc, route_direct = self._route_allocation(vessel, schedule)
+            route_total, route_alloc, route_direct, proposed_ballast = (
+                self._route_allocation(vessel, schedule, with_ballast=True)
+            )
             total_cost += route_total
             direct_sum += route_direct
+            # Existing commitments are sunk for this auction; only *extra*
+            # empty sailing caused by our candidate plan is penalised.
+            key = id(vessel)
+            if key not in self._baseline_ballast_cache:
+                self._baseline_ballast_cache[key] = self._route_allocation(
+                    vessel, vessel.schedule, with_ballast=True
+                )[3]
+            ballast_delta += proposed_ballast - self._baseline_ballast_cache[key]
             for kind, trade in stops:
                 key = id(trade)
                 if kind == "PICK_UP" and key in scheduled_ids and key in offered_ids:
@@ -1649,11 +2045,18 @@ class BiddingStrategy:
                     allocation[key] = route_alloc.get(key, 0.0)
         coverage = len(assignments)
         efficiency = direct_sum / total_cost if total_cost > 0 else 0.0
-        return _CandidatePlan(tuple(signature), assignments, allocation, coverage, efficiency)
+        # A bounded fraction keeps the extra ranking term comparable across
+        # small and large voyages, and avoids extreme penalties on tiny routes.
+        ballast_fraction = min(1.0, max(0.0, ballast_delta) / max(1.0, total_cost))
+        return _CandidatePlan(
+            tuple(signature), assignments, allocation, coverage, efficiency,
+            ballast_delta=ballast_delta, ballast_fraction=ballast_fraction,
+        )
 
     def _top_plans(self, trades, deadline):
         rng = random.Random(self.seed)
         plans = {}
+        attempts = 0
         cost_fn = getattr(self.company, "estimate_schedule_cost", None)
         if not callable(cost_fn):
             cost_fn = None  # Before Person 1 finishes, scheduler runs feasibility-first.
@@ -1661,6 +2064,7 @@ class BiddingStrategy:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
+            attempts += 1
             order = trades.copy()
             if run:
                 rng.shuffle(order)
@@ -1674,19 +2078,51 @@ class BiddingStrategy:
                 seed=self.seed + run,
             )
             try:
-                result = planner.plan(order)
+                if run == 0:
+                    # Preserve the original greedy minimum-cost baseline.
+                    result = planner.plan(order)
+                else:
+                    # Trade order alone rarely changes the greedy optimum.
+                    # Sample alternative vessels / insertion positions, but
+                    # stay within the same fixed auction planning budget.
+                    sample_deadline = min(deadline, monotonic() + min(remaining, 1.0))
+                    result = planner.sample_preauction_plan(
+                        order, sample_deadline,
+                        seed=self.seed + run, run_id=run,
+                    )
                 plan = self._candidate(result, trades)
             except Exception:
                 logger.exception("Bidding: failed to evaluate candidate plan {}", run)
                 continue
             old = plans.get(plan.signature)
-            if old is None or plan.efficiency > old.efficiency:
+            if old is None or self._rank_score(plan) > self._rank_score(old):
                 plans[plan.signature] = plan
-        # AAMAS 2025 Algorithm 3: rank by consolidation efficiency,
-        # rather than ranking first by the number of trades covered.
-        # Each candidate remains individually verified by Person 2's
-        # SchedulingOptimizer; this does not guarantee joint auction wins.
-        return sorted(plans.values(), key=lambda p: p.efficiency, reverse=True)[:self.top_k]
+        # AAMAS-inspired diversity: count genuinely different vessel/trade
+        # assignments separately from alternate insertion-order signatures.
+        # These are measured from verified route plans, not randomized seeds.
+        assignment_patterns = {
+            tuple(sorted((trade_id, id(vessel))
+                         for trade_id, vessel in plan.assignments.items()))
+            for plan in plans.values()
+        }
+        logger.info(
+            "PRE_PLAN_DIVERSITY: attempts={} distinct_routes={} "
+            "distinct_assignments={} top_k={}",
+            attempts, len(plans), len(assignment_patterns), self.top_k,
+        )
+        # AAMAS 2025: consolidation efficiency, with an *experimental*
+        # incremental-ballast penalty. Changes plan selection only; bidding
+        # continues to use 50/50 shared-cost pricing and the P4 bonus.
+        ranked = sorted(plans.values(), key=self._rank_score, reverse=True)[:self.top_k]
+        if ranked:
+            best = ranked[0]
+            logger.info(
+                "PRE_PLAN_RANK: plans={} retained={} efficiency={:.3f} "
+                "extra_ballast={:.2f} ballast_fraction={:.3f} rank_score={:.3f}",
+                len(plans), len(ranked), best.efficiency, best.ballast_delta,
+                best.ballast_fraction, self._rank_score(best),
+            )
+        return ranked
 
     def make_bids(self, trades):
         trades = list(trades)
@@ -1719,7 +2155,7 @@ class BiddingStrategy:
             plans,
             key=lambda p: (
                 sum(key in p.assignments for key in eligible_ids),
-                p.efficiency,
+                self._rank_score(p),
             ),
         )
         logger.info(
@@ -1774,6 +2210,40 @@ class BiddingStrategy:
                 except Exception:
                     logger.exception("Bidding: could not record bid for {}", trade)
             bids.append(Bid(amount=amount, trade=trade))
+            predicted, competitor = None, None
+            try:
+                predicted, competitor = self.company.estimated_competitor_bid(trade)
+                record_prediction = getattr(self.company, "record_market_prediction", None)
+                if callable(record_prediction):
+                    record_prediction(trade, predicted, competitor)
+            except Exception as exc:
+                # Opponent-modelling errors may never prevent bids.
+                logger.debug("P4 price prediction unavailable: {}", exc)
+            if getattr(self.company, "enable_diagnostics", True):
+                try:
+                    # This is the difference between predicted second-price
+                    # payment and AAMAS shared-route allocation, NOT realised
+                    # profit or a guarantee of winning.
+                    spread = (float(predicted) - marginal
+                              if predicted is not None else None)
+                    logger.info(
+                        "BID_AUDIT: route={} -> {} vessel={} standalone={:.2f} "
+                        "allocated={:.2f} base_bid={:.2f} p4_bonus={:.2f} "
+                        "bid={:.2f} predicted_market_price={} "
+                        "estimated_shared_spread={} nearest_competitor={} "
+                        "diagnostic_calibrated_price={}",
+                        trade.origin_port, trade.destination_port,
+                        getattr(vessel, "name", str(vessel)),
+                        absolute, marginal, base_cost, base_cost - amount, amount,
+                        "NA" if predicted is None else f"{float(predicted):.2f}",
+                        "NA" if spread is None else f"{spread:.2f}",
+                        competitor or "NA",
+                        ("NA" if predicted is None else
+                         f"{float(predicted) * self.company.market_price_calibration():.2f}"),
+                    )
+                except Exception as exc:
+                    # Diagnostics must NEVER affect a bid submission.
+                    logger.debug("BID_AUDIT unavailable: {}", exc)
         logger.info(
             "Bidding: {} bids for {} trades, based on {} distinct plans (p_select={:.2f})",
             len(bids), len(trades), len(plans), self.p_select,
@@ -1792,9 +2262,81 @@ from loguru import logger
 class Company6(FuturePlanningMixin, TradingCompany):
     """Person 4 provides pre_inform() through FuturePlanningMixin."""
 
+    enable_future_bid_bonus = True
+    enable_diagnostics = True  # Toggle logging only, never bid/route decisions.
+
+    def _audit_awards(self, result, payments):
+        """Print payment versus *sequential* marginal cost by awarded trade.
+
+        Trade marginals depend on insertion order and don't each correspond to
+        an independently executable vessel route. Negative is a warning to
+        investigate, not proof that the award loses money in the tournament.
+        """
+        for trade in result.scheduled_trades:
+            estimate = result.costs.get(trade)
+            if estimate is None:
+                continue
+            paid = float(payments.get(trade, 0.0))
+            owner = result.assignments.get(trade)
+            logger.info(
+                "TRADE_AUDIT: route={} -> {} vessel={} payment={:.2f} "
+                "sequential_delta={:.2f} estimated_margin={:.2f}",
+                trade.origin_port, trade.destination_port,
+                getattr(owner, "name", str(owner)), paid, estimate, paid - estimate,
+            )
+
+    def _audit_schedule_activity(self, result):
+        """Log predicted incremental vessel cost by activity for awarded routes.
+
+        Per-activity deltas compare the candidate schedule with the current
+        live schedule on each affected vessel. Values can be negative when
+        consolidation reduces earlier costs. They are NOT actual spent fuel.
+        """
+        categories = ("ballast", "laden", "loading", "unloading", "idle")
+        hours = ("ballast_hours", "laden_hours", "idle_hours")
+        totals = dict.fromkeys((*categories, *hours), 0.0)
+        for vessel, updated_schedule in result.schedules.items():
+            try:
+                before = estimate_schedule_cost(
+                    vessel, vessel.schedule, headquarters=self.headquarters,
+                    return_breakdown=True,
+                )
+                after = estimate_schedule_cost(
+                    vessel, updated_schedule, headquarters=self.headquarters,
+                    return_breakdown=True,
+                )
+                delta = {key: after[key] - before[key] for key in totals}
+                for key, value in delta.items():
+                    totals[key] += value
+                logger.info(
+                    "FUEL_AUDIT: vessel={} ballast={:.2f} laden={:.2f} "
+                    "loading={:.2f} unloading={:.2f} idle={:.2f} "
+                    "ballast_hours={:.2f} laden_hours={:.2f} "
+                    "idle_hours={:.2f} estimated_added_cost={:.2f}",
+                    getattr(vessel, "name", str(vessel)),
+                    *(delta[key] for key in categories),
+                    *(delta[key] for key in hours),
+                    after["total"] - before["total"],
+                )
+            except Exception as exc:
+                # No diagnostic exception may block schedule submission.
+                logger.warning("FUEL_AUDIT unavailable for vessel {}: {}",
+                               getattr(vessel, "name", str(vessel)), exc)
+        logger.info(
+            "FUEL_AUDIT_TOTAL: ballast={:.2f} laden={:.2f} "
+            "loading={:.2f} unloading={:.2f} idle={:.2f} "
+            "ballast_hours={:.2f} laden_hours={:.2f} idle_hours={:.2f} "
+            "estimated_added_cost={:.2f} scheduler_estimate={:.2f}",
+            *(totals[key] for key in categories),
+            *(totals[key] for key in hours),
+            sum(totals[key] for key in categories), result.total_extra_cost,
+        )
+
     def inform(self, trades, *args, **kwargs):
         """Person 3's bidding strategy, using Person 2's feasible plans."""
         try:
+            self._p4_init()
+            self._p4_price_predictions = {}  # fresh pre-auction forecast snapshot
             # Person 4: record publicly observable competitor positions before auction.
             try:
                 self.snapshot_competitors()
@@ -1836,6 +2378,12 @@ class Company6(FuturePlanningMixin, TradingCompany):
                     "POST_AUCTION: awarded={} scheduled={} estimated_added_fleet_cost={:.2f}",
                     len(trades), len(result.scheduled_trades), result.total_extra_cost,
                 )
+                if self.enable_diagnostics:
+                    try:
+                        self._audit_awards(result, payments)
+                        self._audit_schedule_activity(result)
+                    except Exception:
+                        logger.exception("Cost diagnostics failed; schedule submission continues")
                 rejected = self.apply_schedules(result.schedules)
                 if rejected:
                     logger.warning("MABLE rejected schedule(s): {}", rejected)
@@ -1903,6 +2451,8 @@ class Company6(FuturePlanningMixin, TradingCompany):
             restarts=8,
             time_budget_s=time_budget_s,
             post_rcl_size=3,
+            local_search_passes=2,
+            local_search_max_moves=8,
         )
 
     def propose_schedules(self, trades):
@@ -1911,3 +2461,4 @@ class Company6(FuturePlanningMixin, TradingCompany):
         return ScheduleProposal(
             result.schedules, result.scheduled_trades, result.costs
         )
+
