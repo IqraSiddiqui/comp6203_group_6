@@ -4,6 +4,7 @@ from loguru import logger
 from source.scheduler import SchedulingOptimizer
 from source.bidding import BiddingStrategy
 from source.future_planning import FuturePlanningMixin
+from source import cost_model
 
 class Companyn(FuturePlanningMixin, TradingCompany):
     """Person 4 provides pre_inform() through FuturePlanningMixin."""
@@ -51,6 +52,18 @@ class Companyn(FuturePlanningMixin, TradingCompany):
                 rejected = self.apply_schedules(result.schedules)
                 if rejected:
                     logger.warning("MABLE rejected schedule(s): {}", rejected)
+
+    # Person 1: bind the company's routing context to the standalone cost model.
+    # Person 2's scheduler and Person 3's bidder both discover this method.
+    def estimate_schedule_cost(self, vessel, schedule):
+        return cost_model.estimate_schedule_cost(
+            vessel, schedule, headquarters=self.headquarters
+        )
+
+    def estimate_trade_cost(self, vessel, trade):
+        return cost_model.estimate_trade_cost(
+            vessel, trade, headquarters=self.headquarters
+        )
 
     def make_scheduler(self, time_budget_s=8.0):
         cost_fn = getattr(self, "estimate_schedule_cost", None)

@@ -105,6 +105,13 @@ class BiddingStrategy:
         return float(vessel.get_cost(fn(hours, vessel.speed)))
 
     def _direct_cost(self, vessel, trade):
+        """Person 1's standalone cost (or existing estimate if unavailable)."""
+        person1 = getattr(self.company, "estimate_trade_cost", None)
+        if callable(person1):
+            cost = float(person1(vessel, trade))
+            if not math.isfinite(cost) or cost < 0:
+                raise ValueError("Invalid Person 1 standalone trade cost")
+            return cost
         return (
             self._sailing_cost(
                 vessel, self._distance(trade.origin_port, trade.destination_port), True
