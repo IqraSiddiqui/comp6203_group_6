@@ -115,6 +115,11 @@ class FakeVessel:
 
     def get_cost(self, consumption):
         return float(consumption)
+    def loadable_cargo_types(self):
+        return ["Oil"]
+
+    def current_load(self, cargo_type):
+        return 0.0
 
 
 class FakeNetwork:
@@ -161,6 +166,7 @@ class FuturePlanningIntegrationTests(unittest.TestCase):
         self.company.fleet = [FakeVessel('mine', Port('Start', 0))]
         self.enemy = types.SimpleNamespace(name='Competitor', fleet=[FakeVessel('enemy', Port('Other', 100))])
         self.company.headquarters = FakeNetwork([self.company, self.enemy])
+        self.company.headquarters.current_time = 0.0
         self.applied = []
         self.company.apply_schedules = lambda schedules: self.applied.append(schedules)
         self.trade = Trade('current', Port('A', 10), Port('B', 20))

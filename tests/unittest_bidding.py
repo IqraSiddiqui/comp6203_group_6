@@ -46,6 +46,11 @@ class FakeTradingCompany:
 
 
 class FakeNetwork:
+    current_time = 0.0
+
+    def get_companies(self):
+        return []
+
     def get_network_distance(self, a, b):
         return abs(a.x - b.x)
 
@@ -99,6 +104,12 @@ class FakeVessel:
         self.hold_capacity = hold_capacity
         self.schedule = FakeSchedule(self)
 
+    def loadable_cargo_types(self):
+        return ["Oil"]
+
+    def current_load(self, cargo_type):
+        return 0.0
+
     def get_loading_time(self, cargo_type, amount):
         return amount / 10
 
@@ -116,6 +127,15 @@ class FakeVessel:
 
     def get_cost(self, consumption):
         return float(consumption)
+    
+    def current_load(self, cargo_type):
+        return 0.0
+
+    def get_travel_time(self, distance):
+        return float(distance) / self.speed
+
+    def get_idle_consumption(self, hours):
+        return 0.5 * hours
 
 
 class BiddingIntegrationTests(unittest.TestCase):
