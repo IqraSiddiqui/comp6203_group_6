@@ -3,14 +3,23 @@ from mable.transport_operation import ScheduleProposal
 from loguru import logger
 from source.scheduler import SchedulingOptimizer
 from source.bidding import BiddingStrategy
+from source.future_planning import FuturePlanningMixin
 
-class Companyn(TradingCompany):
-    def pre_inform(self, trades, time):
-        pass
+class Companyn(FuturePlanningMixin, TradingCompany):
+    """Person 4 provides pre_inform() through FuturePlanningMixin."""
 
     def inform(self, trades, *args, **kwargs):
         """Person 3's bidding strategy, using Person 2's feasible plans."""
         try:
+            # Person 4: record publicly observable competitor positions before auction.
+            try:
+                self.snapshot_competitors()
+                logger.info(
+                    "P4: tracking {} future trades and {} competitors",
+                    len(self._future_trades), len(self._p4_comp_snapshot)
+                )
+            except Exception:
+                logger.exception("P4: Could not snapshot competitors; bidding continues")
             return BiddingStrategy(self).make_bids(trades)
         except Exception:
             logger.exception("Error in Companyn.inform()")
@@ -18,6 +27,11 @@ class Companyn(TradingCompany):
 
     def receive(self, contracts, auction_ledger=None, *args, **kwargs):
         """schedule actual awarded trades, preserving commitments"""
+        # Person 4: learn from the auction ledger, without affecting delivery.
+        try:
+            self.update_opponent_models(auction_ledger)
+        except Exception:
+            logger.exception("P4: Could not update opponent model; scheduling continues")
         trades = [contract.trade for contract in contracts]
         if trades:
             payments = {contract.trade: contract.payment for contract in contracts}
