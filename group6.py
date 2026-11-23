@@ -10,7 +10,7 @@ Pricing: An Automated Agent Framework for Competitive Shipping Company
 Operations under Sealed-Bid Second-Price Auctions", AAMAS 2025.
 https://research.tudelft.nl/files/246062082/group7_report.pdf
 
-Approaches adapted from this paper:
+Approaches adapted from AAMAS'25 winner report paper:
 - Feasible pickup/drop-off insertion and multi-start schedule construction
   (Section 3.1, Algorithms 1-3).
 - Consolidation-efficiency ranking and top-K candidate routes (Section 3.1).
