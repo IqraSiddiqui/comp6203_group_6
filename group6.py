@@ -33,6 +33,17 @@ extensions are not algorithms claimed by the cited paper.
 # All estimates use the simulation's vessel consumption and fuel price APIs.
 
 import math
+from dataclasses import dataclass, field
+from math import isfinite
+from random import Random
+from time import monotonic
+from mable.cargo_bidding import TradingCompany
+from mable.transport_operation import ScheduleProposal
+from loguru import logger
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+import statistics
+from mable.transport_operation import Bid
 
 __all__ = [
     "estimate_trade_cost",
@@ -797,10 +808,7 @@ def estimate_marginal_cost(
 # The scheduler accepts cost_fn(vessel, schedule), which returns the total estimated running cost of a vessel's proposed schedule. We compare the change from each vessel's existing commitments, not its total fleet cost.
 # Every candidate insertion is checked with MABLE's verify_schedule().
 
-from dataclasses import dataclass, field
-from math import isfinite
-from random import Random
-from time import monotonic
+
 
 
 @dataclass
@@ -1344,9 +1352,6 @@ class SchedulingOptimizer:
 # Future-trade value can lower a bid, but uncertain price forecasts are kept separate from live bid pricing. All rival information comes from public data.
 # In the reverse second-price auction, a winning company's payment represents the runner-up bid, not the winning company's own submitted bid.
 
-import statistics
-import math
-
 
 class FuturePlanningMixin:
 
@@ -1858,14 +1863,6 @@ class FuturePlanningMixin:
 # trades use a 50/50 blend of dedicated cost and shared-route allocation.
 # The route-sharing approach is adapted from Mai et al. (AAMAS 2025, §3.2).
 
-from collections import Counter, defaultdict
-from dataclasses import dataclass
-import math
-import random
-from time import monotonic
-
-from loguru import logger
-from mable.transport_operation import Bid
 
 # Bound the number of pre-auction searches to fit the auction callback budget.
 # Candidate schedules are validated, so each restart can be comparatively costly.
@@ -2395,9 +2392,7 @@ class BiddingStrategy:
 
 # MABLE company entry point
 
-from mable.cargo_bidding import TradingCompany
-from mable.transport_operation import ScheduleProposal
-from loguru import logger
+
 class Company6(FuturePlanningMixin, TradingCompany):
     """MABLE trading company combining bidding, routing, and future planning."""
 
