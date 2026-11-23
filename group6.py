@@ -1,5 +1,4 @@
-"""Group 6 maritime shipping agent for the COMP6203 MABLE competition.
-
+"""
 The Company6 agent combines vessel cost estimation, route scheduling, auction
 bidding, future-trade evaluation, and opponent-price diagnostics.
 
