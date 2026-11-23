@@ -3,8 +3,8 @@
 The Company6 agent combines vessel cost estimation, route scheduling, auction
 bidding, future-trade evaluation, and opponent-price diagnostics.
 
-Algorithmic reference
----------------------
+ Algorithmic reference
+
 Mai, W., Ou, X., Liao, X., and Zhang, H. (2025), "Fast Scheduling and Robust
 Pricing: An Automated Agent Framework for Competitive Shipping Company
 Operations under Sealed-Bid Second-Price Auctions", AAMAS 2025.
@@ -26,9 +26,9 @@ extensions are not algorithms claimed by the cited paper.
 """
 
 
-# ---------------------------------------------------------------------------
+
 # Cost estimation
-# ---------------------------------------------------------------------------
+
 # Standalone trade costs are used for bid valuation. Full schedule costs are
 # used to compare routes; their difference gives the marginal insertion cost.
 # All estimates use the simulation's vessel consumption and fuel price APIs.
@@ -792,9 +792,10 @@ def estimate_marginal_cost(
         )
 
     return marginal_cost
-# ---------------------------------------------------------------------------
+
+
 # Route scheduling
-# ---------------------------------------------------------------------------
+
 # The scheduler accepts cost_fn(vessel, schedule), which returns the total
 # estimated running cost of a vessel's proposed schedule. We compare the
 # change from each vessel's existing commitments, not its total fleet cost.
@@ -1339,9 +1340,11 @@ class SchedulingOptimizer:
         if do_local and monotonic() < deadline:
             best = self._local_improve(best, deadline)
         return best
-# ---------------------------------------------------------------------------
+
+
 # Future opportunities and opponent modelling
-# ---------------------------------------------------------------------------
+
+
 # pre_inform() records upcoming cargo. inform() snapshots rival positions and
 # submits bids; receive() updates market observations after the auction.
 # Future-trade value can lower a bid, but uncertain price forecasts are kept
@@ -1365,7 +1368,7 @@ class FuturePlanningMixin:
     MIN_SAMPLES = 3             # ledger samples needed before trusting a factor
     FACTOR_CLIP = (0.5, 5.0)    # discard silly ratios (bad cost guesses)
 
-    # ------------------------------------------------------------------ state
+    #  -> state
     def _model_init(self):
         if getattr(self, "_model_ready", False):
             return
@@ -1390,7 +1393,7 @@ class FuturePlanningMixin:
         self._model_second_price_ratios = []  # payment / min estimated competitor cost
         self._model_future_context = {}       # cached comparison per announced future trade
 
-    # ======================================================== pre_inform
+    #  -> pre_inform
     def pre_inform(self, trades, time):
         """Called by the market before inform(): `trades` will be auctioned at `time`."""
         self._model_init()
@@ -1398,7 +1401,7 @@ class FuturePlanningMixin:
         self._future_auction_time = time
         self._model_future_context.clear()
 
-    # ============================================================ helpers
+    #  -> helpers
     @staticmethod
     def _model_key(trade):
         """Stable key for a trade, so dicts don't depend on object identity."""
@@ -1480,7 +1483,7 @@ class FuturePlanningMixin:
                 best, best_d = f, d
         return best, best_d
 
-    # ========================= Lab 3 Ex 2: competitors' closest vessels
+    #   -> Lab 3 Ex 2: competitors' closest vessels
     def snapshot_competitors(self):
         """Record competitor vessel positions BEFORE the auction. Call in inform().
         receive() runs after vessels may have moved, so we cost from this snapshot."""
@@ -1534,7 +1537,7 @@ class FuturePlanningMixin:
                 out[name] = min(costs)
         return out
 
-    # ================================================ future-opportunity score
+    #   -> future-opportunity score
     def _model_future_baseline(self, future):
         """Cheapest *compatible vessel's* empty repositioning cost to future.
 
@@ -1655,7 +1658,7 @@ class FuturePlanningMixin:
                 return 0.0
         return float(bonus)
 
-    # =================================== Lab 3 Ex 3: auction-outcome analysis
+    #   -> Lab 3 Ex 3: auction-outcome analysis
     def record_our_bid(self, trade, cost, bid):
         """Cache submitted bid values to compare with the auction ledger."""
         self._model_init()
@@ -1853,9 +1856,9 @@ class FuturePlanningMixin:
             ),
         }
 
-# ---------------------------------------------------------------------------
+
 # Pre-auction bidding
-# ---------------------------------------------------------------------------
+
 # Construct distinct feasible plans, rank them by route consolidation and
 # added ballast, and estimate how consistently each trade appears. Selected
 # trades use a 50/50 blend of dedicated cost and shared-route allocation.
@@ -2400,9 +2403,9 @@ class BiddingStrategy:
             logger.info("Future planning: future bonus adjusted {} of {} bids", future_discounts, len(bids))
         return bids
 
-# ---------------------------------------------------------------------------
+
 # MABLE company entry point
-# ---------------------------------------------------------------------------
+
 from mable.cargo_bidding import TradingCompany
 from mable.transport_operation import ScheduleProposal
 from loguru import logger
