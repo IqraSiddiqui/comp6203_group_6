@@ -516,8 +516,7 @@ def estimate_schedule_cost(
         )
 
     events = get_simple_schedule()
-    # Record each cost component alongside the total. With return_breakdown=False,
-    # the caller still receives a single monetary cost value.
+    # Record each cost component alongside the total. With return_breakdown=False
     components = {
         "ballast": 0.0,
         "laden": 0.0,
@@ -795,9 +794,7 @@ def estimate_marginal_cost(
 
 # Route scheduling
 
-# The scheduler accepts cost_fn(vessel, schedule), which returns the total
-# estimated running cost of a vessel's proposed schedule. We compare the
-# change from each vessel's existing commitments, not its total fleet cost.
+# The scheduler accepts cost_fn(vessel, schedule), which returns the total estimated running cost of a vessel's proposed schedule. We compare the change from each vessel's existing commitments, not its total fleet cost.
 # Every candidate insertion is checked with MABLE's verify_schedule().
 
 from dataclasses import dataclass, field
@@ -1233,8 +1230,7 @@ class SchedulingOptimizer:
                 if improved:
                     break
             if not improved:
-                # Within-vessel reorder: swap adjacent pickup order and find
-                # a new minimum-cost insertion plan on that vessel.
+                # Within-vessel reorder: swap adjacent pickup order and find a new minimum-cost insertion plan on that vessel.
                 for vessel, order in orders.items():
                     if monotonic() >= deadline:
                         break
@@ -1258,8 +1254,7 @@ class SchedulingOptimizer:
                         break
             if not improved:
                 break
-        # Log zero-improvement rounds too, so search effort can be compared
-        # with the savings achieved without affecting route submission.
+        # Log zero-improvement rounds too, so search effort can be compared with the savings achieved without affecting route submission.
         logger.info(
             "LOCAL_SEARCH: accepted_moves={} candidates_tested={} "
             "feasible_candidates={} incremental_cost_before={:.2f} "
@@ -1340,16 +1335,14 @@ class SchedulingOptimizer:
             best = self._local_improve(best, deadline)
         return best
 
-
+#-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
 # Future opportunities and opponent modelling
 
 
 # pre_inform() records upcoming cargo. inform() snapshots rival positions and
 # submits bids; receive() updates market observations after the auction.
-# Future-trade value can lower a bid, but uncertain price forecasts are kept
-# separate from live bid pricing. All rival information comes from public data.
-# In the reverse second-price auction, a winning company's payment represents
-# the runner-up bid, not the winning company's own submitted bid.
+# Future-trade value can lower a bid, but uncertain price forecasts are kept separate from live bid pricing. All rival information comes from public data.
+# In the reverse second-price auction, a winning company's payment represents the runner-up bid, not the winning company's own submitted bid.
 
 import statistics
 import math
@@ -1855,6 +1848,8 @@ class FuturePlanningMixin:
             ),
         }
 
+#-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 # Pre-auction bidding
 
@@ -2269,12 +2264,8 @@ class BiddingStrategy:
                 max(plan_weights), min(plan_weights),
                 total_weight ** 2 / sum(w ** 2 for w in plan_weights),
             )
-        # Robustness extension of AAMAS pre-scheduling: select a *single*
-        # verified candidate route plan that covers the largest number of
-        # frequency-eligible trades. The submitted set is then a subset of
-        # that plan, rather than a union of potentially incompatible plans.
-        # This does NOT guarantee that MABLE will fulfil every partial win,
-        # but avoids one source of bid-set incompatibility.
+        # Robustness extension of AAMAS pre-scheduling: select a *single* verified candidate route plan that covers the largest number of frequency-eligible trades. The submitted set is then a subset of that plan, rather than a union of potentially incompatible plans.
+        # This does NOT guarantee that MABLE will fulfil every partial win, but avoids one source of bid-set incompatibility.
         eligible_ids = {
             id(trade) for trade in trades
             if weighted_presence[id(trade)] > 0
@@ -2336,8 +2327,7 @@ class BiddingStrategy:
                 logger.exception("Bidding: could not price trade {}; skipping", trade)
                 continue
 
-            # Reduce the effective bid only when carrying this trade improves
-            # the vessel's expected position for announced future cargo.
+            # Reduce the effective bid only when carrying this trade improves the vessel's expected position for announced future cargo.
             amount = base_cost
             if getattr(self.company, "enable_future_bid_bonus", True):
                 bonus_fn = getattr(self.company, "future_trade_bonus", None)
