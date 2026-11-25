@@ -2,6 +2,15 @@
 The Company6 agent combines vessel cost estimation, route scheduling, auction
 bidding, future-trade evaluation, and opponent-price diagnostics.
 
+Classes in this file
+- CostEstimationError: Signals invalid or unavailable vessel, schedule, or trade cost estimates.
+- PlanningResult: Holds a proposed fleet schedule, its assigned trades, and incremental costs.
+- SchedulingOptimizer: Builds and improves feasible vessel schedules for awarded trades.
+- FuturePlanningMixin: Tracks upcoming trades and public market observations to estimate future value and opponent pricing.
+- _CandidatePlan: Stores a candidate trade-to-vessel plan and its cost and route-quality metrics.
+- BiddingStrategy: Selects candidate plans and computes auction bids for the company.
+- Company6: Integrates bidding, schedule updates, future planning, and diagnostics as a MABLE trading company.
+
  Algorithmic reference
 
 Mai, W., Ou, X., Liao, X., and Zhang, H. (2025), "Fast Scheduling and Robust
